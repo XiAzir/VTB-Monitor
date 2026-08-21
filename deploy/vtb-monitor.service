@@ -1,0 +1,25 @@
+[Unit]
+Description=VTB Monitor website and local management API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vtb-monitor
+Group=vtb-monitor
+WorkingDirectory=/opt/vtb-monitor
+EnvironmentFile=/etc/vtb-monitor.env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node server/index.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/vtb-monitor
+MemoryMax=768M
+
+[Install]
+WantedBy=multi-user.target

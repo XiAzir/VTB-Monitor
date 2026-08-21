@@ -1,0 +1,175 @@
+import { fail, redirect } from '@sveltejs/kit';
+import type { Actions, PageServerLoad } from './$types';
+import { getPiStatus } from '$lib/server/pi';
+import {
+  acknowledgeAlert, changeAdminPassword, createAdminSession, createApiToken, createStreamer, deleteAdminSession, enqueueJob,
+  findAdminByUsername, getDashboardStats, getSetting, listAdminStreamers, listAlerts, listApiTokens,
+  listAudit, listJobs, listSecretMetadata, putSecret, replaceManualScheduleRules, setForecast, setSetting, updateStreamer
+} from '$lib/server/store';
+import { verifyPassword } from '$lib/server/security';
+
+interface SmtpSettings {
+  host: string;
+  port: number;
+  secure: boolean;
+  username: string;
+  from: string;
+  to: string;
+}
+
+export const load: PageServerLoad = ({ locals }) => {
+  if (!locals.adminSession) return { authenticated: false as const };
+  return {
+    authenticated: true as const,
+    admin: locals.adminSession,
+    stats: getDashboardStats(),
+    streamers: listAdminStreamers(),
+    alerts: listAlerts(),
+    jobs: listJobs(30),
+    audit: listAudit(30),
+    secrets: listSecretMetadata(),
+    tokens: listApiTokens(),
+    pi: getPiStatus(),
+    smtp: getSetting<SmtpSettings | null>('smtp', null)
+  };
+};
+
+export const actions: Actions = {
+  login: async ({ request, cookies }) => {
+    const form = await request.formData();
+    const username = String(form.get('username') ?? '').trim();
+    const password = String(form.get('password') ?? '');
+    const admin = findAdminByUsername(username);
+    if (!admin || !(await verifyPassword(password, String(admin.password_hash)))) return fail(400, { loginError: '用户名或密码错误' });
+    const token = createAdminSession(String(admin.id));
+    cookies.set('vtbm_session', token, { path: '/', httpOnly: true, sameSite: 'strict', secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 3600 });
+    redirect(303, '/admin');
+  },
+  logout: ({ cookies }) => {
+    const token = cookies.get('vtbm_session');
+    if (token) deleteAdminSession(token);
+    cookies.delete('vtbm_session', { path: '/' });
+    redirect(303, '/admin');
+  },
+  changePassword: async ({ request, locals }) => {
+    requireAdmin(locals.adminSession);
+    const form = await request.formData();
+    const password = String(form.get('password') ?? '');
+    const confirm = String(form.get('confirm') ?? '');
+    if (password !== confirm) return fail(400, { formError: '两次输入的密码不一致' });
+    try {
+      await changeAdminPassword(locals.adminSession!.adminId, password, `admin:${locals.adminSession!.adminId}`);
+      return { saved: '管理员密码已更新' };
+    } catch (error) { return fail(400, { formError: formatError(error) }); }
+  },
+  createStreamer: async ({ request, locals }) => {
+    requireAdmin(locals.adminSession);
+    const form = await request.formData();
+    try {
+      const id = createStreamer({
+        name: String(form.get('name') ?? ''), slug: String(form.get('slug') ?? ''),
+        biliUid: String(form.get('biliUid') ?? ''), roomId: String(form.get('roomId') ?? ''),
+        dynamicUrl: String(form.get('dynamicUrl') ?? '').trim() || undefined,
+        liveUrl: String(form.get('liveUrl') ?? '').trim() || undefined
+      }, `admin:${locals.adminSession!.adminId}`);
+      return { createdStreamerId: id };
+    } catch (error) { return fail(400, { formError: formatError(error) }); }
+  },
+  updateStreamer: async ({ request, locals }) => {
+    requireAdmin(locals.adminSession);
+    const form = await request.formData();
+    try {
+      updateStreamer(String(form.get('id')), {
+        name: String(form.get('name') ?? ''), slug: String(form.get('slug') ?? ''),
+        biliUid: String(form.get('biliUid') ?? ''), roomId: String(form.get('roomId') ?? ''),
+        dynamicUrl: String(form.get('dynamicUrl') ?? ''), liveUrl: String(form.get('liveUrl') ?? ''),
+        enabled: form.get('enabled') === 'on', livePollSeconds: Number(form.get('livePollSeconds')),
+        dynamicPollSeconds: Number(form.get('dynamicPollSeconds'))
+      }, Number(form.get('version')), `admin:${locals.adminSession!.adminId}`);
+      return { saved: '主播配置已更新' };
+    } catch (error) { return fail(400, { formError: formatError(error) }); }
+  },
+  setManualForecast: async ({ request, locals }) => {
+    requireAdmin(locals.adminSession);
+    const form = await request.formData();
+    try {
+      const predicted = new Date(String(form.get('predictedStartAt') ?? ''));
+      setForecast({ streamerId: String(form.get('streamerId')), predictedStartAt: predicted.toISOString(),
+        confidence: Number(form.get('confidence') ?? 100), source: 'manual',
+        reason: String(form.get('reason') ?? '').trim() || '管理员人工设置', evidence: [] }, `admin:${locals.adminSession!.adminId}`);
+      return { saved: '人工预测已锁定' };
+    } catch (error) { return fail(400, { formError: formatError(error) }); }
+  },
+  saveManualSchedule: async ({ request, locals }) => {
+    requireAdmin(locals.adminSession);
+    const form = await request.formData();
+    try {
+      const rules = String(form.get('rules') ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
+        const match = line.match(/^([1-7])\s+([0-2]\d:[0-5]\d)(?:\s+(.+))?$/);
+        if (!match) throw new Error(`周表行格式错误：${line}`);
+        return { weekday: Number(match[1]), localTime: match[2], title: match[3] };
+      });
+      replaceManualScheduleRules(String(form.get('streamerId')), rules, `admin:${locals.adminSession!.adminId}`);
+      enqueueJob('pi_analyze', String(form.get('streamerId')), { reason: 'manual_schedule_changed' }, 10,
+        new Date().toISOString(), `manual-schedule:${form.get('streamerId')}:${Date.now()}`);
+      return { saved: rules.length ? '人工周表已保存并锁定' : '人工周表已清空' };
+    } catch (error) { return fail(400, { formError: formatError(error) }); }
+  },
+  saveCookie: async ({ request, locals }) => {
+    requireAdmin(locals.adminSession);
+    const form = await request.formData();
+    const cookie = String(form.get('cookie') ?? '').trim();
+    if (!cookie) return fail(400, { formError: 'Cookie 不能为空' });
+    putSecret('bilibili_cookie', cookie, `admin:${locals.adminSession!.adminId}`);
+    enqueueJob('validate_cookie', null, {}, 1, new Date().toISOString(), `validate-cookie:${Date.now()}`);
+    return { saved: 'B站 Cookie 已加密保存' };
+  },
+  savePi: async ({ request, locals }) => {
+    requireAdmin(locals.adminSession);
+    const form = await request.formData();
+    const provider = String(form.get('provider') ?? 'openai');
+    const modelId = String(form.get('modelId') ?? '').trim();
+    if (!modelId) return fail(400, { formError: '模型 ID 不能为空' });
+    setSetting('pi_profile', { provider, modelId, baseUrl: String(form.get('baseUrl') ?? '').trim() || undefined,
+      apiKeySecret: 'pi_api_key', thinkingLevel: String(form.get('thinkingLevel') ?? 'low') }, `admin:${locals.adminSession!.adminId}`);
+    const apiKey = String(form.get('apiKey') ?? '').trim();
+    if (apiKey) putSecret('pi_api_key', apiKey, `admin:${locals.adminSession!.adminId}`);
+    return { saved: 'Pi 配置已保存' };
+  },
+  saveSmtp: async ({ request, locals }) => {
+    requireAdmin(locals.adminSession);
+    const form = await request.formData();
+    setSetting('smtp', { host: String(form.get('host') ?? '').trim(), port: Number(form.get('port') ?? 587),
+      secure: form.get('secure') === 'on', username: String(form.get('username') ?? '').trim(),
+      from: String(form.get('from') ?? '').trim(), to: String(form.get('to') ?? '').trim() }, `admin:${locals.adminSession!.adminId}`);
+    const password = String(form.get('password') ?? '').trim();
+    if (password) putSecret('smtp_password', password, `admin:${locals.adminSession!.adminId}`);
+    return { saved: 'SMTP 配置已保存' };
+  },
+  createToken: async ({ request, locals }) => {
+    requireAdmin(locals.adminSession);
+    const form = await request.formData();
+    const scopes = form.getAll('scope').map(String);
+    const created = createApiToken(String(form.get('name') ?? 'server-agent'), scopes, `admin:${locals.adminSession!.adminId}`);
+    return { apiToken: created.token };
+  },
+  runOperation: async ({ request, locals }) => {
+    requireAdmin(locals.adminSession);
+    const form = await request.formData();
+    const streamerId = String(form.get('streamerId') ?? '');
+    const operation = String(form.get('operation') ?? 'sync');
+    enqueueJob(operation === 'refresh' ? 'sync_streamer' : operation === 'sync' ? 'sync_streamer' : 'pi_analyze', streamerId,
+      operation === 'refresh' ? { fullSync: true } : { operation }, 5,
+      new Date().toISOString(), `admin:${operation}:${streamerId}:${Date.now()}`);
+    return { saved: '任务已加入队列' };
+  },
+  acknowledge: async ({ request, locals }) => {
+    requireAdmin(locals.adminSession);
+    const form = await request.formData();
+    acknowledgeAlert(String(form.get('alertId')), `admin:${locals.adminSession!.adminId}`);
+    return { saved: '告警已确认' };
+  }
+};
+
+function requireAdmin(session: App.Locals['adminSession']): void { if (!session) redirect(303, '/admin'); }
+function formatError(error: unknown): string { return error instanceof Error ? error.message : String(error); }

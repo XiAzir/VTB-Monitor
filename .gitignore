@@ -1,0 +1,12 @@
+node_modules/
+.svelte-kit/
+build/
+coverage/
+playwright-report/
+test-results/
+.env
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
