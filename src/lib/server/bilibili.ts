@@ -217,7 +217,19 @@ export class BilibiliClient {
   }
 
   private async fetchResponse(url: string, extraHeaders: Record<string, string>): Promise<Response> {
-    const headers: Record<string, string> = { 'user-agent': USER_AGENT, ...extraHeaders };
+    const headers: Record<string, string> = {
+      'user-agent': USER_AGENT,
+      'accept': 'application/json, text/plain, */*',
+      'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'accept-encoding': 'gzip, deflate, br',
+      'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'sec-fetch-dest': 'empty',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'same-site',
+      ...extraHeaders
+    };
     if (this.cookie) headers.cookie = this.cookie;
     const response = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) });
     if (!response.ok) throw new BilibiliError(`B站 HTTP ${response.status}`, response.status, response.status);
@@ -261,6 +273,7 @@ export function normalizeDynamic(item: JsonObject, streamerId: string): Normaliz
   if (major.article?.covers) mediaUrls.push(...major.article.covers);
   if (major.opus?.pics) mediaUrls.push(...major.opus.pics.map((entry: JsonObject) => entry.url).filter(Boolean));
   const publishedTs = Number(modules.module_author?.pub_ts ?? item.pub_ts ?? 0);
+  const rawAvatarUrl = modules.module_author?.face ? String(modules.module_author.face) : null;
   return {
     id,
     streamerId,
@@ -274,7 +287,7 @@ export function normalizeDynamic(item: JsonObject, streamerId: string): Normaliz
     likeCount: Number(modules.module_stat?.like?.count ?? 0),
     mediaUrls: [...new Set(mediaUrls.map(String))],
     rawExcerpt: JSON.stringify({ author: modules.module_author, majorType: major.type }).slice(0, 4000)
-    , avatarUrl: modules.module_author?.face ? String(modules.module_author.face) : null
+    , avatarUrl: rawAvatarUrl ? normalizeImageUrl(rawAvatarUrl) : null
   };
 }
 
@@ -301,6 +314,7 @@ export function normalizeComment(reply: JsonObject, rootId: string | null): Norm
   const id = String(reply.rpid_str ?? reply.rpid ?? '');
   const inferredRoot = rootId ?? (Number(reply.root ?? 0) > 0 ? String(reply.root) : null);
   const pictures = Array.isArray(reply.content?.pictures) ? reply.content.pictures : [];
+  const rawAvatarUrl = reply.member?.avatar ? String(reply.member.avatar) : null;
   return {
     id,
     dynamicId: '',
@@ -308,7 +322,7 @@ export function normalizeComment(reply: JsonObject, rootId: string | null): Norm
     parentId: Number(reply.parent ?? 0) > 0 ? String(reply.parent) : null,
     authorUid: String(reply.member?.mid ?? '0'),
     authorName: String(reply.member?.uname ?? '未知用户'),
-    avatarUrl: reply.member?.avatar ? String(reply.member.avatar) : null,
+    avatarUrl: rawAvatarUrl ? normalizeImageUrl(rawAvatarUrl) : null,
     message: String(reply.content?.message ?? ''),
     likeCount: Number(reply.like ?? 0),
     replyCount: Number(reply.rcount ?? 0),
@@ -381,4 +395,12 @@ function asJsonObject(value: unknown): JsonObject {
 function basenameWithoutExtension(url: string): string {
   const part = url.slice(url.lastIndexOf('/') + 1);
   return part.slice(0, part.lastIndexOf('.'));
+}
+
+function normalizeImageUrl(url: string): string {
+  // Handle protocol-relative URLs (//example.com/image.jpg)
+  if (url.startsWith('//')) return `https:${url}`;
+  // Upgrade http to https for hdslb.com domains
+  if (/^http:\/\/.*\.hdslb\.com\//i.test(url)) return url.replace(/^http:/i, 'https:');
+  return url;
 }

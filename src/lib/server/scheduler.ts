@@ -176,18 +176,27 @@ export class Scheduler {
       }
     }
     let detailBudget = (initializing || fullSync) ? Number.POSITIVE_INFINITY : 20;
+    let detailsFetched = 0;
     for (const dynamic of dynamics) {
       const existing = getDb().prepare('SELECT text,raw_excerpt FROM dynamics WHERE id=?').get(dynamic.id) as Row | undefined;
       let enriched = dynamic;
       if (detailBudget > 0 && (initializing || fullSync || !existing || !String(existing.text ?? '').trim() ||
         (String(existing.text ?? '').includes('[') && !String(existing.raw_excerpt ?? '').includes('"emojiMap"')))) {
         try {
+          // 添加延迟以避免触发B站风控（第一个请求不延迟）
+          if (detailsFetched > 0) {
+            await delay(2000 + Math.floor(Math.random() * 1000)); // 2-3秒随机延迟
+          }
           const detail = await client.fetchDynamicDetail(dynamic.id);
           enriched = { ...dynamic, text: detail.text || dynamic.text,
             mediaUrls: [...new Set([...(dynamic.mediaUrls ?? []), ...(detail.mediaUrls ?? [])])],
             emojiMap: detail.emojiMap, commentOid: detail.commentOid ?? dynamic.commentOid, commentType: detail.commentType ?? dynamic.commentType };
+          detailsFetched += 1;
         } catch (error) {
-          upsertAlert(`dynamic-detail:${dynamic.id}`, 'info', '动态详情解析失败', formatError(error));
+          // 只在非412错误时创建告警，避免告警泛滥
+          if (!(error instanceof BilibiliError && (error.code === -412 || error.status === 412))) {
+            upsertAlert(`dynamic-detail:${dynamic.id}`, 'info', '动态详情解析失败', formatError(error));
+          }
         }
         detailBudget -= 1;
       }

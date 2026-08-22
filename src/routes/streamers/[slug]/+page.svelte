@@ -1,6 +1,7 @@
 <script lang="ts">
   import { ArrowLeft, CalendarDays, Clock3, ExternalLink, MessageSquare, Radio, RefreshCw, History, Image as ImageIcon } from '@lucide/svelte';
   import { confidenceClass, formatDateTime, relativeTime, sourceLabel, richTextHtml } from '$lib/format';
+  import { proxyBilibiliImage } from '$lib/image';
   let { data } = $props();
   const weekdays = ['', '周一', '周二', '周三', '周四', '周五', '周六', '周日'];
 </script>
@@ -10,7 +11,7 @@
 <section class="page">
   <a class="back" href="/"><ArrowLeft size={16} /> 返回监控台</a>
   <div class="streamer-header">
-    {#if data.streamer.avatarUrl}<img src={data.streamer.avatarUrl} alt="" />{/if}
+    {#if data.streamer.avatarUrl}<img src={proxyBilibiliImage(data.streamer.avatarUrl)} alt="" />{/if}
     <div class="streamer-title">
       <h1>{data.streamer.name}</h1>
       <span>UID {data.streamer.biliUid} · 房间 {data.streamer.roomId}</span>

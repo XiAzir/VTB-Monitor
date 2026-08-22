@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Radio, RefreshCw, Clock3, ExternalLink, CircleDot } from '@lucide/svelte';
   import { confidenceClass, formatDateTime, relativeTime, sourceLabel } from '$lib/format';
+  import { proxyBilibiliImage } from '$lib/image';
   let { data } = $props();
 
   function statusLabel(status: string) {
@@ -31,7 +32,7 @@
         <article class:live-card={streamer.liveStatus === 'live'} class="monitor-row panel">
           <a class="identity" href={`/streamers/${streamer.slug}`}>
             {#if streamer.avatarUrl}
-              <img src={streamer.avatarUrl} alt="" loading="lazy" />
+              <img src={proxyBilibiliImage(streamer.avatarUrl)} alt="" loading="lazy" />
             {:else}
               <span class="avatar-fallback">{streamer.name.slice(0, 1)}</span>
             {/if}

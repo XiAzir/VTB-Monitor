@@ -1,6 +1,7 @@
 <script lang="ts">
   import { ArrowLeft, ExternalLink, Heart, MessageSquare, Pin, RefreshCw, UserRoundCheck, Image as ImageIcon } from '@lucide/svelte';
   import { formatDateTime, richTextHtml } from '$lib/format';
+  import { proxyBilibiliImage } from '$lib/image';
   let { data } = $props();
   const displayText = $derived(data.selectedRevision ? String(data.selectedRevision.snapshot.text ?? data.selectedRevision.text) : data.dynamic.text);
   const displayMedia = $derived(data.selectedRevision ? data.selectedRevision.media : data.dynamic.media);
@@ -38,7 +39,7 @@
     {#each data.comments as comment}
       <article class="comment panel">
         <div class="comment-author">
-          {#if comment.avatarUrl}<img src={comment.avatarUrl} alt="" loading="lazy" />{:else}<span></span>{/if}
+          {#if comment.avatarUrl}<img src={proxyBilibiliImage(comment.avatarUrl)} alt="" loading="lazy" />{:else}<span></span>{/if}
           <div><strong>{comment.authorName}</strong><small>{formatDateTime(comment.publishedAt)}</small></div>
           {#if comment.isStreamer}<span class="signal" title="主播本人"><UserRoundCheck size={16} /></span>{/if}
           {#if comment.isPinned}<span class="signal" title="置顶评论"><Pin size={15} /></span>{/if}
