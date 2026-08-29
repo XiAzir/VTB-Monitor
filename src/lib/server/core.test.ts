@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 import { BilibiliClient, extractInitialState, normalizeComment, normalizeDynamic, resolveRoomRecord } from './bilibili';
 import { closeDb, getDb } from './db';
 import { decryptSecret, encryptSecret, hashPassword, verifyPassword } from './security';
+import { richTextHtml } from '$lib/format';
 import {
   createStreamer, enqueueJob, getSecret, leaseNextJob, listComments, listDynamics, markMissingRootCommentsUnavailable, putSecret,
   setForecast, upsertComment, upsertDynamic
@@ -24,6 +25,35 @@ describe('Bilibili normalization', () => {
     const comment = normalizeComment({ rpid_str: '9', member: { mid: '42', uname: '主播', avatar: 'a' },
       content: { message: '晚点播' }, ctime: 1700000000, like: 5, parent: 8 }, '7');
     expect(comment).toMatchObject({ id: '9', rootId: '7', parentId: '8', message: '晚点播' });
+  });
+
+  it('normalizes Bilibili image URLs and proxies inline emoji', () => {
+    const dynamic = normalizeDynamic({ id_str: '124', modules: {
+      module_author: { pub_ts: 1700000000, face: '//i2.hdslb.com/face.jpg' },
+      module_dynamic: { desc: { text: '[测试]' }, major: { draw: { items: [{ src: 'http://i1.hdslb.com/image.png' }] } } }
+    } }, '42');
+    expect(dynamic.avatarUrl).toBe('https://i2.hdslb.com/face.jpg');
+    expect(dynamic.mediaUrls).toEqual(['https://i1.hdslb.com/image.png']);
+    expect(richTextHtml('[测试]', { '[测试]': 'https://i0.hdslb.com/emoji.png' }))
+      .toContain('src="/api/image-proxy/i0.hdslb.com/emoji.png"');
+  });
+
+  it('marks a dynamic feed complete only after passing the cutoff', async () => {
+    const page = (items: Array<{ id_str: string; pub_ts: number }>, hasMore: boolean, offset: string) => ({
+      code: 0, data: { items, has_more: hasMore, offset }
+    });
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify(page([
+        { id_str: 'new', pub_ts: 1735689600 }, { id_str: 'pinned-old', pub_ts: 1609459200 }
+      ], true, 'page-2')), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(page([
+        { id_str: 'older', pub_ts: 1609459200 }
+      ], false, '')), { status: 200 }));
+    try {
+      const result = await new BilibiliClient().fetchSpaceDynamics('42', 10, '2024-01-01T00:00:00.000Z');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result).toMatchObject({ complete: true, items: [{ id: 'new' }] });
+    } finally { fetchMock.mockRestore(); }
   });
 
   it('resolves Bilibili short room ids', () => {
@@ -77,6 +107,17 @@ describe('security and persistence', () => {
     const second = enqueueJob('test-job', null, { value: 2 }, 10, new Date().toISOString(), 'same-job');
     expect(second).toBe(first);
     expect(String(leaseNextJob(['test-job'])?.id)).toBe(first);
+    getDb().prepare("UPDATE jobs SET status='done' WHERE id=?").run(first);
+    expect(enqueueJob('test-job', null, { value: 3 }, 10, new Date().toISOString(), 'same-job')).toBe(first);
+    expect(leaseNextJob(['test-job'])).toBeNull();
+    expect(getDb().prepare('SELECT status FROM jobs WHERE id=?').get(first)).toMatchObject({ status: 'done' });
+  });
+
+  it('releases expired running jobs after a process restart', () => {
+    const id = enqueueJob('expired-job', null, {}, 10, new Date(Date.now() - 60_000).toISOString(), 'expired-running-job');
+    getDb().prepare("UPDATE jobs SET status='running',lease_until=? WHERE id=?")
+      .run(new Date(Date.now() - 1_000).toISOString(), id);
+    expect(String(leaseNextJob(['expired-job'])?.id)).toBe(id);
   });
 
   it('records revisions, comment hierarchy, and protects manual forecasts', () => {
@@ -87,9 +128,17 @@ describe('security and persistence', () => {
     expect(upsertDynamic({ ...base, text: '第二版' }).changed).toBe(true);
     expect(listDynamics(streamerId)[0].text).toBe('第二版');
     expect(Number((getDb().prepare('SELECT COUNT(*) count FROM dynamic_revisions').get() as { count: number }).count)).toBe(1);
+    upsertDynamic({ ...base, text: '带图片', mediaUrls: ['https://example.invalid/image.png'] });
+    expect(listDynamics(streamerId)[0].media).toHaveLength(1);
+    upsertDynamic({ ...base, text: '图片已移除', mediaUrls: [] });
+    expect(listDynamics(streamerId)[0].media).toHaveLength(0);
     upsertComment({ id: 'c1', dynamicId: 'dyn-1', authorUid: '10001', authorName: '测试主播', message: '今晚晚点',
-      isStreamer: true, publishedAt: new Date().toISOString() });
+      isStreamer: true, publishedAt: new Date().toISOString(), mediaUrls: ['https://example.invalid/comment.png'] });
     expect(listComments('dyn-1')[0]).toMatchObject({ id: 'c1', isStreamer: true });
+    expect(listComments('dyn-1')[0].media).toHaveLength(1);
+    upsertComment({ id: 'c1', dynamicId: 'dyn-1', authorUid: '10001', authorName: '测试主播', message: '图片已移除',
+      isStreamer: true, publishedAt: new Date().toISOString(), mediaUrls: [] });
+    expect(listComments('dyn-1')[0].media).toHaveLength(0);
     markMissingRootCommentsUnavailable('dyn-1', []);
     expect(listComments('dyn-1')[0].state).toBe('unavailable');
 

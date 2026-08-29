@@ -113,6 +113,7 @@ export async function changeAdminPassword(adminId: string, password: string, act
   withTransaction((db) => {
     db.prepare('UPDATE admins SET password_hash=?,force_password_change=0,updated_at=? WHERE id=?')
       .run(encoded, now(), adminId);
+    db.prepare('DELETE FROM admin_sessions WHERE admin_id=?').run(adminId);
     insertAudit(db, actor, adminId, 'admin.password.change', 'admin', adminId, null, { password: '[REDACTED]' });
   });
 }
@@ -269,6 +270,22 @@ export function listDynamicRevisions(id: string): DynamicRevisionRecord[] {
       createdAt: String(row.created_at), snapshot, media: listMediaByUrls(Array.isArray(snapshot.mediaUrls) ? snapshot.mediaUrls.map(String) : []), emojiMap: parseEmojiMap(snapshot.raw_excerpt) }; });
 }
 
+export function getLatestCompleteDynamicSnapshot(id: string): { text: string; mediaUrls: string[]; emojiMap: Record<string, string> } | null {
+  const rows = getDb().prepare(`SELECT text,snapshot_json FROM dynamic_revisions WHERE dynamic_id=?
+    ORDER BY created_at DESC LIMIT 100`).all(id) as Row[];
+  let fallback: { text: string; mediaUrls: string[]; emojiMap: Record<string, string> } | null = null;
+  for (const row of rows) {
+    const snapshot = safeJson<Row>(String(row.snapshot_json), {});
+    const emojiMap = parseEmojiMap(snapshot.raw_excerpt);
+    const text = String(snapshot.text ?? row.text ?? '');
+    const mediaUrls = Array.isArray(snapshot.mediaUrls) ? snapshot.mediaUrls.map(String) : [];
+    const candidate = { text, mediaUrls, emojiMap };
+    if (text.trim()) return candidate;
+    if (!fallback && (mediaUrls.length > 0 || Object.keys(emojiMap).length > 0)) fallback = candidate;
+  }
+  return fallback;
+}
+
 export function getDynamicRevision(id: string, revisionId: string): DynamicRevisionRecord | null {
   const row = getDb().prepare('SELECT id,dynamic_id,text,created_at,snapshot_json FROM dynamic_revisions WHERE id=? AND dynamic_id=?').get(revisionId, id) as Row | undefined;
   if (!row) return null;
@@ -320,6 +337,11 @@ export function listComments(dynamicId: string, limit = 50, before?: string): Co
   return rows.map(rowToComment);
 }
 
+export function countRootComments(dynamicId: string): number {
+  const row = getDb().prepare('SELECT COUNT(*) AS count FROM comments WHERE dynamic_id=? AND root_id IS NULL').get(dynamicId) as Row;
+  return number(row.count);
+}
+
 export function listReplies(dynamicId: string, rootId: string): CommentRecord[] {
   return (getDb().prepare(`SELECT * FROM comments WHERE dynamic_id = ? AND root_id = ? ORDER BY published_at, id`)
     .all(dynamicId, rootId) as Row[]).map(rowToComment);
@@ -357,11 +379,11 @@ export function upsertDynamic(input: NormalizedDynamicInput): { created: boolean
         .run(input.type, input.text, input.sourceUrl, timestamp, timestamp, hash, input.commentOid ?? null,
           input.commentType ?? null, input.commentCount ?? 0, input.likeCount ?? 0, mergeRawExcerpt(input.rawExcerpt, input.emojiMap), input.id);
     }
-    if ((input.mediaUrls ?? []).length > 0) tx.prepare('DELETE FROM dynamic_media WHERE dynamic_id=?').run(input.id);
+    tx.prepare('DELETE FROM dynamic_media WHERE dynamic_id=?').run(input.id);
     linkMediaUrls(tx, 'dynamic', input.id, input.mediaUrls ?? []);
   });
   if (!existing || changed) enqueueJob('pi_analyze', input.streamerId, { dynamicId: input.id }, 30, timestamp, `pi-dynamic:${input.id}:${hash}`);
-  enqueueJob('sync_comments', input.id, {}, 50, timestamp, `comments:${input.id}`);
+  if (!existing) enqueueJob('sync_comments', input.id, {}, 50, timestamp, `comments:${input.id}:initial`);
   return { created: !existing, changed };
 }
 
@@ -392,6 +414,7 @@ export function upsertComment(input: NormalizedCommentInput): { created: boolean
         .run(input.authorName, input.avatarUrl ?? null, input.message, input.likeCount ?? 0, input.replyCount ?? 0,
           input.isPinned ? 1 : 0, input.isStreamer ? 1 : 0, hash, timestamp, timestamp, input.id);
     }
+    tx.prepare('DELETE FROM comment_media WHERE comment_id=?').run(input.id);
     linkMediaUrls(tx, 'comment', input.id, input.mediaUrls ?? []);
   });
   const highSignal = Boolean(input.isStreamer || input.isPinned || containsTimeSignal(input.message));
@@ -471,9 +494,11 @@ export function enqueueJob(type: string, entityId: string | null, payload: unkno
   const timestamp = now();
   getDb().prepare(`INSERT INTO jobs(id, type, entity_id, payload_json, priority, due_at, dedupe_key, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(dedupe_key) DO UPDATE SET due_at=MIN(jobs.due_at, excluded.due_at),
-      priority=MIN(jobs.priority, excluded.priority), updated_at=excluded.updated_at,
-      status=CASE WHEN jobs.status IN ('done','failed') THEN 'pending' ELSE jobs.status END`)
+    ON CONFLICT(dedupe_key) DO UPDATE SET
+      due_at=CASE WHEN jobs.status IN ('pending','retry') THEN MIN(jobs.due_at, excluded.due_at) ELSE jobs.due_at END,
+      priority=CASE WHEN jobs.status IN ('pending','retry') THEN MIN(jobs.priority, excluded.priority) ELSE jobs.priority END,
+      updated_at=CASE WHEN jobs.status IN ('pending','retry') THEN excluded.updated_at ELSE jobs.updated_at END,
+      payload_json=CASE WHEN jobs.status IN ('pending','retry') THEN excluded.payload_json ELSE jobs.payload_json END`)
     .run(id, type, entityId, JSON.stringify(payload ?? {}), priority, dueAt, dedupeKey ?? null, timestamp, timestamp);
   if (!dedupeKey) return id;
   const stored = getDb().prepare('SELECT id FROM jobs WHERE dedupe_key=?').get(dedupeKey) as Row;
@@ -483,7 +508,7 @@ export function enqueueJob(type: string, entityId: string | null, payload: unkno
 export function leaseNextJob(types?: string[]): Row | null {
   return withTransaction((db) => {
     const placeholders = types?.length ? `AND type IN (${types.map(() => '?').join(',')})` : '';
-    const row = db.prepare(`SELECT * FROM jobs WHERE status IN ('pending','retry') AND due_at <= ?
+    const row = db.prepare(`SELECT * FROM jobs WHERE status IN ('pending','retry','running') AND due_at <= ?
       AND (lease_until IS NULL OR lease_until < ?) ${placeholders} ORDER BY priority, due_at LIMIT 1`)
       .get(now(), now(), ...(types ?? [])) as Row | undefined;
     if (!row) return null;
@@ -557,6 +582,15 @@ export function createApiToken(name: string, scopes: string[], actor = 'admin-ui
     .run(id, name.trim(), value.prefix, value.hash, JSON.stringify([...new Set(scopes)]), now());
   insertAudit(getDb(), actor, null, 'api_token.create', 'api_token', id, null, { name, scopes });
   return { id, token: value.token };
+}
+
+export function revokeApiToken(id: string, actor = 'admin-ui'): void {
+  const token = getDb().prepare('SELECT id,name,token_prefix,revoked_at FROM api_tokens WHERE id=?').get(id) as Row | undefined;
+  if (!token) throw new Error('API 令牌不存在');
+  if (token.revoked_at) return;
+  const timestamp = now();
+  getDb().prepare('UPDATE api_tokens SET revoked_at=? WHERE id=?').run(timestamp, id);
+  insertAudit(getDb(), actor, null, 'api_token.revoke', 'api_token', id, token, { ...token, revoked_at: timestamp });
 }
 
 export function authenticateApiToken(token: string): { id: string; name: string; scopes: string[] } | null {
@@ -717,9 +751,12 @@ function listMediaByUrls(urls: string[]): MediaAsset[] {
 function mergeRawExcerpt(raw: string | null | undefined, emojiMap?: Record<string, string>): string | null {
   if (!raw && !emojiMap) return null;
   let value: Row = {};
-  try { value = raw ? JSON.parse(raw) as Row : {}; } catch { value = { excerpt: raw }; }
-  if (emojiMap && Object.keys(emojiMap).length > 0) value.emojiMap = emojiMap;
-  return JSON.stringify(value).slice(0, 4000);
+  try { value = raw ? JSON.parse(raw) as Row : {}; } catch { value = { excerpt: raw?.slice(0, 2000) }; }
+  if (emojiMap && Object.keys(emojiMap).length > 0) value = { emojiMap, ...value };
+  const serialized = JSON.stringify(value);
+  if (serialized.length <= 4000) return serialized;
+  const compact = emojiMap && Object.keys(emojiMap).length > 0 ? JSON.stringify({ emojiMap }) : JSON.stringify({ excerpt: raw?.slice(0, 2000) });
+  return compact.length <= 4000 ? compact : JSON.stringify({ excerpt: '元数据过长，已省略' });
 }
 
 function parseEmojiMap(raw: unknown): Record<string, string> {
@@ -734,7 +771,7 @@ function linkMediaUrls(db: ReturnType<typeof getDb>, kind: 'dynamic' | 'comment'
   const link = kind === 'dynamic' ? 'dynamic_media' : 'comment_media';
   const column = kind === 'dynamic' ? 'dynamic_id' : 'comment_id';
   urls.forEach((rawSourceUrl, position) => {
-    const sourceUrl = /^http:\/\/i0\.hdslb\.com\//i.test(rawSourceUrl) ? rawSourceUrl.replace(/^http:/i, 'https:') : rawSourceUrl;
+    const sourceUrl = normalizeMediaUrl(rawSourceUrl);
     let media = db.prepare('SELECT id FROM media_assets WHERE source_url=? ORDER BY created_at LIMIT 1').get(sourceUrl) as Row | undefined;
     if (!media) {
       media = { id: randomUUID() };
@@ -748,6 +785,11 @@ function linkMediaUrls(db: ReturnType<typeof getDb>, kind: 'dynamic' | 'comment'
                 ON CONFLICT(${column},media_id) DO UPDATE SET position=excluded.position`)
       .run(ownerId, mediaId, position);
   });
+}
+
+function normalizeMediaUrl(url: string): string {
+  if (url.startsWith('//')) return `https:${url}`;
+  return /^http:\/\/[^/]*\.hdslb\.com\//i.test(url) ? url.replace(/^http:/i, 'https:') : url;
 }
 
 function rowToSummary(row: Row): StreamerSummary {

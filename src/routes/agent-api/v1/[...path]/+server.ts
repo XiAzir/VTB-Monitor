@@ -110,14 +110,18 @@ async function idempotent(request: Request, token: Token, path: string,
   work: () => Promise<{ status: number; body: unknown }>): Promise<Response> {
   const key = request.headers.get('idempotency-key');
   if (!key || key.length > 200) error(400, 'Idempotency-Key is required');
+  const storedKey = `${token.id}:${key}`;
   const db = getDb();
   db.prepare('DELETE FROM idempotency_keys WHERE expires_at < ?').run(new Date().toISOString());
-  const existing = db.prepare('SELECT * FROM idempotency_keys WHERE key=? AND actor_id=?').get(key, token.id) as Record<string, unknown> | undefined;
-  if (existing) return json(JSON.parse(String(existing.response_json)), { status: Number(existing.response_status) });
+  const existing = db.prepare('SELECT * FROM idempotency_keys WHERE key=?').get(storedKey) as Record<string, unknown> | undefined;
+  if (existing) {
+    if (existing.method !== request.method || existing.path !== path) error(409, 'Idempotency-Key was already used for another operation');
+    return json(JSON.parse(String(existing.response_json)), { status: Number(existing.response_status) });
+  }
   const result = await work();
   db.prepare(`INSERT INTO idempotency_keys(key,actor_id,method,path,response_status,response_json,expires_at,created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(key, token.id, request.method, path, result.status, JSON.stringify(result.body),
+    .run(storedKey, token.id, request.method, path, result.status, JSON.stringify(result.body),
       new Date(Date.now() + 24 * 3600_000).toISOString(), new Date().toISOString());
   return json(result.body, { status: result.status });
 }

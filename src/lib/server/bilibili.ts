@@ -48,9 +48,14 @@ export class BilibiliClient {
     };
   }
 
-  async fetchSpaceDynamics(biliUid: string, limit = 30, since?: string): Promise<NormalizedDynamicInput[]> {
+  async fetchSpaceDynamics(biliUid: string, limit = 30, since?: string): Promise<{
+    items: NormalizedDynamicInput[];
+    complete: boolean;
+  }> {
     const items: JsonObject[] = [];
     let offset = '';
+    let complete = false;
+    let previousOffset = '';
     while (items.length < limit) {
       const url = new URL('https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space');
       url.searchParams.set('host_mid', biliUid);
@@ -59,16 +64,30 @@ export class BilibiliClient {
       if (data.code !== 0) throw new BilibiliError(String(data.message ?? '动态接口失败'), Number(data.code));
       const pageItems: JsonObject[] = Array.isArray(data.data?.items) ? data.data.items as JsonObject[] : [];
       items.push(...pageItems);
-      if (since && pageItems.some((item) => dynamicPublishedAt(item) < since)) break;
-      if (!data.data?.has_more || !data.data?.offset || pageItems.length === 0) break;
+      if (since && pageItems.length > 0 && pageItems.every((item) => dynamicPublishedAt(item) < since)) {
+        complete = true;
+        break;
+      }
+      if (!data.data?.has_more || !data.data?.offset || pageItems.length === 0) {
+        complete = true;
+        break;
+      }
+      previousOffset = offset;
       offset = String(data.data.offset);
+      if (offset === previousOffset) break;
     }
-    return items.slice(0, limit).map((item) => normalizeDynamic(item, biliUid))
-      .filter((item) => !since || item.publishedAt >= since);
+    return {
+      items: items.slice(0, limit).map((item) => normalizeDynamic(item, biliUid))
+        .filter((item) => !since || item.publishedAt >= since),
+      complete
+    };
   }
 
   async fetchDynamicDetail(dynamicId: string): Promise<Pick<NormalizedDynamicInput, 'text' | 'mediaUrls' | 'commentOid' | 'commentType' | 'emojiMap'>> {
-    const response = await this.fetchResponse(`https://www.bilibili.com/opus/${dynamicId}`, { referer: 'https://www.bilibili.com/' });
+    const response = await this.fetchResponse(`https://www.bilibili.com/opus/${dynamicId}`, {
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      referer: 'https://www.bilibili.com/'
+    });
     const state = extractInitialState(await response.text());
     const detail = state.detail ?? {};
     const modules = Array.isArray(detail.modules) ? detail.modules : [];
@@ -82,7 +101,7 @@ export class BilibiliClient {
         for (const paragraph of content.paragraphs) {
           const parts = Array.isArray(paragraph?.text?.nodes) ? paragraph.text.nodes.map((node: JsonObject) => {
             const emoji = node?.rich?.emoji;
-            if (emoji?.text && emoji?.icon_url) emojiMap[String(emoji.text)] = String(emoji.icon_url);
+            if (emoji?.text && emoji?.icon_url) emojiMap[String(emoji.text)] = normalizeImageUrl(String(emoji.icon_url));
             return node?.word?.words ?? node?.rich?.orig_text ?? node?.text ?? '';
           }).filter(Boolean) : [];
           if (parts.length) paragraphs.push(parts.join(''));
@@ -92,7 +111,7 @@ export class BilibiliClient {
       collectImageUrls(module?.module_top?.display?.album?.pics, mediaUrls);
     }
     const basic = detail.basic ?? {};
-    return { text: paragraphs.join('\n').trim(), mediaUrls: [...new Set(mediaUrls)], emojiMap,
+    return { text: paragraphs.join('\n').trim(), mediaUrls: normalizeImageUrls(mediaUrls), emojiMap,
       commentOid: basic.comment_id_str ? String(basic.comment_id_str) : null,
       commentType: basic.comment_type != null ? String(basic.comment_type) : null };
   }
@@ -285,9 +304,9 @@ export function normalizeDynamic(item: JsonObject, streamerId: string): Normaliz
     commentType: item.basic?.comment_type != null ? String(item.basic.comment_type) : null,
     commentCount: Number(modules.module_stat?.comment?.count ?? 0),
     likeCount: Number(modules.module_stat?.like?.count ?? 0),
-    mediaUrls: [...new Set(mediaUrls.map(String))],
-    rawExcerpt: JSON.stringify({ author: modules.module_author, majorType: major.type }).slice(0, 4000)
-    , avatarUrl: rawAvatarUrl ? normalizeImageUrl(rawAvatarUrl) : null
+    mediaUrls: normalizeImageUrls(mediaUrls.map(String)),
+    rawExcerpt: JSON.stringify({ author: { mid: modules.module_author?.mid, name: modules.module_author?.name }, majorType: major.type }),
+    avatarUrl: rawAvatarUrl ? normalizeImageUrl(rawAvatarUrl) : null
   };
 }
 
@@ -328,7 +347,7 @@ export function normalizeComment(reply: JsonObject, rootId: string | null): Norm
     replyCount: Number(reply.rcount ?? 0),
     isPinned: Boolean(reply.up_action?.like || reply.reply_control?.is_up_top),
     publishedAt: new Date(Number(reply.ctime ?? 0) * 1000 || Date.now()).toISOString(),
-    mediaUrls: pictures.map((picture: JsonObject) => picture.img_src ?? picture.url ?? picture).filter(Boolean).map(String)
+    mediaUrls: normalizeImageUrls(pictures.map((picture: JsonObject) => picture.img_src ?? picture.url ?? picture).filter(Boolean).map(String))
   };
 }
 
@@ -403,4 +422,8 @@ function normalizeImageUrl(url: string): string {
   // Upgrade http to https for hdslb.com domains
   if (/^http:\/\/.*\.hdslb\.com\//i.test(url)) return url.replace(/^http:/i, 'https:');
   return url;
+}
+
+function normalizeImageUrls(urls: string[]): string[] {
+  return [...new Set(urls.map(normalizeImageUrl))];
 }

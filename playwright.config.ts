@@ -13,7 +13,7 @@ export default defineConfig({
   webServer: {
     command: 'node scripts/e2e-server.mjs',
     url: 'http://127.0.0.1:4313/',
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: false,
     timeout: 30_000
   }
 });

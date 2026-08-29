@@ -33,12 +33,14 @@ export async function downloadMediaAsset(mediaId: string): Promise<void> {
   await mkdir(tempDir, { recursive: true });
   const tempPath = join(tempDir, `${randomUUID()}.part`);
   try {
-    const requestUrl = /^http:\/\/i0\.hdslb\.com\//i.test(sourceUrl) ? sourceUrl.replace(/^http:/i, 'https:') : sourceUrl;
+    const requestUrl = /^http:\/\/[^/]*\.hdslb\.com\//i.test(sourceUrl) ? sourceUrl.replace(/^http:/i, 'https:') : sourceUrl;
     const response = await fetch(requestUrl, {
       headers: { 'user-agent': 'Mozilla/5.0', referer: 'https://www.bilibili.com/', accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8' },
       signal: AbortSignal.timeout(30_000)
     });
     if (!response.ok || !response.body) throw new Error(`图片下载 HTTP ${response.status}`);
+    const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
+    if (!contentType?.startsWith('image/')) throw new Error('图片源返回了非图片内容');
     const declaredSize = Number(response.headers.get('content-length') ?? 0);
     if (declaredSize > config.maxMediaFileBytes) throw new Error('图片超过单文件 25MB 限制');
 

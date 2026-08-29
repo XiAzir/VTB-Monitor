@@ -30,10 +30,10 @@
     {/if}
     <footer><span><Heart size={15} /> {data.dynamic.likeCount}</span><span><MessageSquare size={15} /> {data.dynamic.commentCount}</span></footer>
   </article>
-  <div class="dynamic-actions"><form method="POST" action="?/refresh"><button class="button" type="submit"><RefreshCw size={15} /> 刷新此动态</button></form></div>
+  <div class="dynamic-actions">{#if data.canRefresh}<form method="POST" action="?/refresh"><button class="button" type="submit"><RefreshCw size={15} /> 刷新此动态</button></form>{:else}<a class="button" href="/admin"><RefreshCw size={15} /> 登录后刷新</a>{/if}</div>
   {#if data.revisions.length > 0}<section class="revisions panel"><strong>历史版本</strong>{#each data.revisions as revision}<a href={`/dynamics/${data.dynamic.id}?revision=${revision.id}`}>{formatDateTime(revision.createdAt)} · {revision.text || '无文字正文'}</a>{/each}</section>{/if}
 
-  <div class="comments-heading"><h2>评论</h2><span>{data.comments.length} 条主评论已载入</span></div>
+  <div class="comments-heading"><h2>评论</h2><span>显示 {data.comments.length} / {data.totalRootComments} 条主评论</span></div>
   <div class="comments">
     {#if data.comments.length === 0}<div class="panel empty">评论仍在后台同步，或该动态暂无评论。</div>{/if}
     {#each data.comments as comment}
@@ -58,6 +58,7 @@
       </article>
     {/each}
   </div>
+  {#if data.page > 1 || data.nextBefore}<nav class="comment-pages" aria-label="评论分页">{#if data.page > 1}<a class="button" href={`/dynamics/${data.dynamic.id}`}>返回最新评论</a>{/if}{#if data.nextBefore}<a class="button" href={`/dynamics/${data.dynamic.id}?page=${data.page + 1}&before=${encodeURIComponent(data.nextBefore)}`}>更早评论</a>{/if}</nav>{/if}
 </section>
 
 <style>
@@ -83,6 +84,7 @@
   .comments-heading h2 { margin: 0; font-size: 18px; }
   .comments-heading span { color: var(--muted); font-size: 12px; }
   .comments { display: grid; gap: 9px; }
+  .comment-pages { display: flex; justify-content: space-between; gap: 10px; margin-top: 14px; }
   .comment { padding: 15px 17px; }
   .comment-author { display: flex; align-items: center; gap: 9px; }
   .comment-author img, .comment-author > span:first-child { width: 34px; height: 34px; border-radius: 50%; background: #e7eaec; }

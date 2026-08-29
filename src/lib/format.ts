@@ -31,9 +31,24 @@ export function sourceLabel(source: string | null): string {
 export function richTextHtml(text: string, emojiMap: Record<string, string> = {}): string {
   const escaped = text.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char] ?? char));
   return escaped.replace(/\[[^\]\r\n]+\]/g, (token) => {
-    const url = emojiMap[token];
-    return url && /^https:\/\//.test(url)
+    const url = proxyImageUrl(emojiMap[token]);
+    return url
       ? `<img class="inline-emoji" src="${url}" alt="${token}" title="${token}" loading="lazy">`
       : token;
   });
+}
+
+function proxyImageUrl(value: string | undefined): string | null {
+  if (!value) return null;
+  const normalized = value.startsWith('//') ? `https:${value}` : value;
+  if (!/^https:\/\//.test(normalized)) return null;
+  try {
+    const url = new URL(normalized);
+    if (url.hostname === 'hdslb.com' || url.hostname.endsWith('.hdslb.com')) {
+      return `/api/image-proxy/${url.hostname}${url.pathname}${url.search}`;
+    }
+    return normalized.replace(/["'<>]/g, (char) => encodeURIComponent(char));
+  } catch {
+    return null;
+  }
 }

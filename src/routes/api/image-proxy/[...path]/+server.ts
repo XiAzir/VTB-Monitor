@@ -7,8 +7,9 @@ const ALLOWED_DOMAINS = [
   'i2.hdslb.com',
   'hdslb.com'
 ];
+const MAX_PROXY_BYTES = 25 * 1024 * 1024;
 
-export const GET: RequestHandler = async ({ params, setHeaders }) => {
+export const GET: RequestHandler = async ({ params }) => {
   const path = params.path;
 
   if (!path) {
@@ -32,10 +33,9 @@ export const GET: RequestHandler = async ({ params, setHeaders }) => {
       url.hostname === domain || url.hostname.endsWith(`.${domain}`)
     );
 
-    if (!isAllowed) {
-      throw error(403, 'Domain not allowed');
-    }
+    if (!isAllowed) throw error(403, 'Domain not allowed');
   } catch (err) {
+    if (err && typeof err === 'object' && 'status' in err) throw err;
     throw error(400, 'Invalid URL');
   }
 
@@ -47,6 +47,7 @@ export const GET: RequestHandler = async ({ params, setHeaders }) => {
         'Referer': 'https://www.bilibili.com/',
         'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
       },
+      redirect: 'error',
       signal: AbortSignal.timeout(10000)
     });
 
@@ -54,16 +55,21 @@ export const GET: RequestHandler = async ({ params, setHeaders }) => {
       throw error(response.status, `Failed to fetch image: ${response.statusText}`);
     }
 
-    const contentType = response.headers.get('content-type') || 'image/jpeg';
+    const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
+    if (!contentType?.startsWith('image/')) throw error(502, 'Upstream did not return an image');
+    const contentLength = Number(response.headers.get('content-length') ?? 0);
+    if (contentLength > MAX_PROXY_BYTES) throw error(413, 'Image is too large');
     const cacheControl = response.headers.get('cache-control') || 'public, max-age=31536000';
 
-    setHeaders({
-      'Content-Type': contentType,
-      'Cache-Control': cacheControl,
-      'Access-Control-Allow-Origin': '*'
-    });
-
-    return new Response(response.body, {
+    let streamedBytes = 0;
+    const limitedBody = response.body?.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        streamedBytes += chunk.byteLength;
+        if (streamedBytes > MAX_PROXY_BYTES) throw new Error('Image exceeded proxy limit');
+        controller.enqueue(chunk);
+      }
+    }));
+    return new Response(limitedBody, {
       status: 200,
       headers: {
         'Content-Type': contentType,
@@ -72,6 +78,7 @@ export const GET: RequestHandler = async ({ params, setHeaders }) => {
     });
   } catch (err) {
     console.error('Image proxy error:', err);
+    if (err && typeof err === 'object' && 'status' in err) throw err;
     throw error(500, 'Failed to fetch image');
   }
 };

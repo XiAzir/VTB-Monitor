@@ -141,7 +141,9 @@
             <form class="panel form-panel" method="POST" action="?/createToken"><div class="form-title"><KeyRound size={17} /><strong>创建管理 API 令牌</strong></div>
               <div class="field"><label for="token-name">令牌名称</label><input id="token-name" name="name" value="server-agent" required /></div>
               {#each ['status:read','config:read','config:write','ops:run','audit:read','secrets:read','secrets:write'] as scope}<label class="checkbox"><input type="checkbox" name="scope" value={scope} /> {scope}</label>{/each}
-              <button class="button" type="submit">创建一次性令牌</button></form>
+              <button class="button" type="submit">创建一次性令牌</button>
+              {#if data.tokens.length > 0}<div class="token-list">{#each data.tokens as token}<div><span><strong>{String(token.name)}</strong><small>{String(token.token_prefix)}… · {token.revoked_at ? '已撤销' : '有效'}</small></span>{#if !token.revoked_at}<button class="button danger" type="submit" formaction="?/revokeToken" name="tokenId" value={String(token.id)}>撤销</button>{/if}</div>{/each}</div>{/if}
+            </form>
           </div>
         </section>
       </div>
@@ -157,6 +159,7 @@
   .login-icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 6px; background: #202427; color: white; }
   .login h1 { margin: 0; font-size: 21px; }.login p { margin: -10px 0 0; color: var(--muted); font-size: 13px; }
   .top-notice, .token-reveal { margin-bottom: 14px; }.token-reveal { display: grid; gap: 7px; padding: 12px; border: 1px solid #deb969; background: #fff5dc; }.token-reveal code { overflow-wrap: anywhere; }
+  .token-list { display: grid; border-top: 1px solid var(--line); }.token-list > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 9px; }.token-list span { min-width: 0; }.token-list strong, .token-list small { display: block; overflow: hidden; text-overflow: ellipsis; }.token-list small { margin-top: 2px; color: var(--muted); font-size: 10px; }.token-list .button { min-height: 30px; padding: 0 9px; font-size: 11px; }
   .stats-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 28px; }
   .stat { min-height: 92px; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 3px 9px; padding: 14px; }.stat :global(svg) { grid-row: 1 / 3; color: var(--muted); }.stat strong { font-size: 22px; }.stat span { color: var(--muted); font-size: 11px; }
   .admin-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 24px; align-items: start; }.admin-main { display: grid; gap: 32px; }.admin-grid aside { display: grid; gap: 16px; position: sticky; top: 78px; }

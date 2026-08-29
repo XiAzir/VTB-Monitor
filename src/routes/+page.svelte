@@ -15,7 +15,7 @@
   <div class="page-heading">
     <div>
       <h1>主播监控台</h1>
-      <p>直播状态每 30 秒刷新，动态与开播预测持续更新。</p>
+      <p>直播状态按后台间隔刷新，动态与开播预测持续更新。</p>
     </div>
     <span class="updated"><RefreshCw size={14} /> 数据生成于 {relativeTime(data.generatedAt)}</span>
   </div>
@@ -96,4 +96,3 @@
     .forecast { grid-column: 1 / -1; grid-row: 3; justify-self: start; border-top: 1px solid var(--line); padding-top: 11px; width: 100%; }
   }
 </style>
-

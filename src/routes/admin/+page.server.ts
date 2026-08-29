@@ -1,10 +1,10 @@
-import { fail, redirect } from '@sveltejs/kit';
+import { error, fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { getPiStatus } from '$lib/server/pi';
 import {
   acknowledgeAlert, changeAdminPassword, createAdminSession, createApiToken, createStreamer, deleteAdminSession, enqueueJob,
   findAdminByUsername, getDashboardStats, getSetting, listAdminStreamers, listAlerts, listApiTokens,
-  listAudit, listJobs, listSecretMetadata, putSecret, replaceManualScheduleRules, setForecast, setSetting, updateStreamer
+  listAudit, listJobs, listSecretMetadata, putSecret, replaceManualScheduleRules, revokeApiToken, setForecast, setSetting, updateStreamer
 } from '$lib/server/store';
 import { verifyPassword } from '$lib/server/security';
 
@@ -51,16 +51,17 @@ export const actions: Actions = {
     cookies.delete('vtbm_session', { path: '/' });
     redirect(303, '/admin');
   },
-  changePassword: async ({ request, locals }) => {
-    requireAdmin(locals.adminSession);
+  changePassword: async ({ request, locals, cookies }) => {
+    requireAdmin(locals.adminSession, true);
     const form = await request.formData();
     const password = String(form.get('password') ?? '');
     const confirm = String(form.get('confirm') ?? '');
     if (password !== confirm) return fail(400, { formError: '两次输入的密码不一致' });
     try {
       await changeAdminPassword(locals.adminSession!.adminId, password, `admin:${locals.adminSession!.adminId}`);
-      return { saved: '管理员密码已更新' };
     } catch (error) { return fail(400, { formError: formatError(error) }); }
+    cookies.delete('vtbm_session', { path: '/' });
+    redirect(303, '/admin');
   },
   createStreamer: async ({ request, locals }) => {
     requireAdmin(locals.adminSession);
@@ -153,6 +154,14 @@ export const actions: Actions = {
     const created = createApiToken(String(form.get('name') ?? 'server-agent'), scopes, `admin:${locals.adminSession!.adminId}`);
     return { apiToken: created.token };
   },
+  revokeToken: async ({ request, locals }) => {
+    requireAdmin(locals.adminSession);
+    const form = await request.formData();
+    try {
+      revokeApiToken(String(form.get('tokenId') ?? ''), `admin:${locals.adminSession!.adminId}`);
+      return { saved: '管理 API 令牌已撤销' };
+    } catch (reason) { return fail(400, { formError: formatError(reason) }); }
+  },
   runOperation: async ({ request, locals }) => {
     requireAdmin(locals.adminSession);
     const form = await request.formData();
@@ -171,5 +180,8 @@ export const actions: Actions = {
   }
 };
 
-function requireAdmin(session: App.Locals['adminSession']): void { if (!session) redirect(303, '/admin'); }
+function requireAdmin(session: App.Locals['adminSession'], allowPasswordChange = false): void {
+  if (!session) redirect(303, '/admin');
+  if (session.forcePasswordChange && !allowPasswordChange) error(403, '请先修改初始化管理员密码');
+}
 function formatError(error: unknown): string { return error instanceof Error ? error.message : String(error); }

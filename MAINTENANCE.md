@@ -152,7 +152,7 @@ console.log('Cookie状态:', validation);
 
 // 获取动态
 const dynamics = await client.fetchSpaceDynamics('7706705', 5);
-console.log('获取动态数:', dynamics.length);
+console.log('获取动态数:', dynamics.items.length, '是否完整:', dynamics.complete);
 ```
 
 #### 检查图片代理

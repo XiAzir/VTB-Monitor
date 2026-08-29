@@ -4,6 +4,7 @@
   import { proxyBilibiliImage } from '$lib/image';
   let { data } = $props();
   const weekdays = ['', '周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+  const liveStatusLabel = (status: string) => status === 'live' ? '正在直播' : status === 'rotating' ? '轮播中' : status === 'offline' ? '未开播' : '状态未知';
 </script>
 
 <svelte:head><title>{data.streamer.name} · 监控室老大爷</title></svelte:head>
@@ -16,12 +17,12 @@
       <h1>{data.streamer.name}</h1>
       <span>UID {data.streamer.biliUid} · 房间 {data.streamer.roomId}</span>
     </div>
-    <div class="header-actions"><form method="POST" action="?/refresh"><button class="button" type="submit"><RefreshCw size={15} /> 刷新半年动态</button></form><a class="button" href={`https://live.bilibili.com/${data.streamer.roomId}`} target="_blank" rel="noreferrer">直播间 <ExternalLink size={15} /></a></div>
+    <div class="header-actions">{#if data.canRefresh}<form method="POST" action="?/refresh"><button class="button" type="submit"><RefreshCw size={15} /> 刷新半年动态</button></form>{:else}<a class="button" href="/admin"><RefreshCw size={15} /> 登录后刷新</a>{/if}<a class="button" href={`https://live.bilibili.com/${data.streamer.roomId}`} target="_blank" rel="noreferrer">直播间 <ExternalLink size={15} /></a></div>
   </div>
 
   <div class="status-band">
     <div class="status-primary">
-      <span class={`badge ${data.streamer.liveStatus}`}>{data.streamer.liveStatus === 'live' ? '正在直播' : data.streamer.liveStatus === 'rotating' ? '轮播中' : '未开播'}</span>
+      <span class={`badge ${data.streamer.liveStatus}`}>{liveStatusLabel(data.streamer.liveStatus)}</span>
       <strong>{data.streamer.liveTitle || '直播间当前没有标题'}</strong>
     </div>
     <div class="forecast-block">
@@ -80,7 +81,7 @@
         </div>
       </section>
       <section class="side-section">
-        <div class="section-heading"><div><h2>近期直播</h2><p>以 30 秒轮询观测</p></div><Radio size={18} /></div>
+        <div class="section-heading"><div><h2>近期直播</h2><p>按后台间隔轮询观测</p></div><Radio size={18} /></div>
         <div class="panel sessions">
           {#if data.liveSessions.length === 0}<div class="empty small">暂无直播记录</div>{/if}
           {#each data.liveSessions as session}

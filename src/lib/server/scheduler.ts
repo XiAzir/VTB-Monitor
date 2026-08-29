@@ -3,7 +3,7 @@ import { config } from './config';
 import { getDb } from './db';
 import { downloadMediaAsset } from './media';
 import {
-  enqueueJob, failJob, finishJob, getSecret, leaseNextJob, rollOverdueForecasts,
+  enqueueJob, failJob, finishJob, getDynamic, getLatestCompleteDynamicSnapshot, getSecret, leaseNextJob, rollOverdueForecasts,
   markMissingRepliesUnavailable, markMissingRootCommentsUnavailable,
   resolveAlert, updateLiveState, updateSecretStatus, upsertAlert, upsertComment, upsertDynamic, markDynamicDeleted, markMissingDynamicsDeleted
 } from './store';
@@ -33,7 +33,7 @@ export class Scheduler {
   start(): void {
     if (this.running) return;
     this.running = true;
-    this.timers.push(setInterval(() => void this.pollLive(), config.livePollSeconds * 1000));
+    this.timers.push(setInterval(() => void this.pollLive(), 15_000));
     this.timers.push(setInterval(() => this.enqueueDueDynamicSyncs(), 30_000));
     this.timers.push(setInterval(() => rollOverdueForecasts(), 60_000));
     this.timers.push(setInterval(() => void this.work(), 750));
@@ -67,7 +67,11 @@ export class Scheduler {
 
   private async pollLive(): Promise<void> {
     if (!this.running) return;
-    const rows = getDb().prepare('SELECT id,room_id,bili_uid FROM streamers WHERE enabled=1 ORDER BY id').all() as Row[];
+    const candidates = getDb().prepare(`SELECT s.id,s.room_id,s.bili_uid,s.live_poll_seconds,ls.checked_at
+      FROM streamers s LEFT JOIN live_state ls ON ls.streamer_id=s.id WHERE s.enabled=1 ORDER BY s.id`).all() as Row[];
+    const timestamp = Date.now();
+    const rows = candidates.filter((row) => !row.checked_at ||
+      timestamp - new Date(String(row.checked_at)).getTime() >= Number(row.live_poll_seconds) * 1000);
     if (rows.length === 0) return;
     const cookie = getSecret('bilibili_cookie');
     try {
@@ -118,7 +122,7 @@ export class Scheduler {
     switch (job.type) {
       case 'sync_streamer': return this.syncStreamer(String(job.entity_id), payload);
       case 'refresh_dynamic': return this.refreshDynamic(String(job.entity_id));
-      case 'sync_comments': return this.syncComments(String(job.entity_id));
+      case 'sync_comments': return this.syncComments(String(job.entity_id), payload);
       case 'sync_sub_replies': return this.syncSubReplies(payload);
       case 'download_media': return downloadMediaAsset(String(job.entity_id));
       case 'pi_analyze': return analyzeStreamerWithPi(String(job.entity_id), payload);
@@ -159,14 +163,14 @@ export class Scheduler {
     since.setMonth(since.getMonth() - 6);
     const cookie = getSecret('bilibili_cookie');
     let client = new BilibiliClient(cookie);
-    let dynamics;
+    let feed;
     try {
-      dynamics = await client.fetchSpaceDynamics(String(streamer.bili_uid), (initializing || fullSync) ? 1000 : 30, (initializing || fullSync) ? since.toISOString() : undefined);
+      feed = await client.fetchSpaceDynamics(String(streamer.bili_uid), (initializing || fullSync) ? 1000 : 30, (initializing || fullSync) ? since.toISOString() : undefined);
     } catch (error) {
       if (cookie && isInvalidCookie(error)) {
         upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', '已自动回退到匿名抓取，请尽快在后台更新 Cookie。');
         client = new BilibiliClient(null);
-        dynamics = await client.fetchSpaceDynamics(String(streamer.bili_uid), (initializing || fullSync) ? 1000 : 30, (initializing || fullSync) ? since.toISOString() : undefined);
+        feed = await client.fetchSpaceDynamics(String(streamer.bili_uid), (initializing || fullSync) ? 1000 : 30, (initializing || fullSync) ? since.toISOString() : undefined);
       } else {
         if (error instanceof BilibiliError && (error.status === 412 || error.code === 412)) {
           upsertAlert('bilibili-dynamic-rate-limited', 'warning', cookie ? '动态请求被 B站 风控拦截' : '动态抓取需要 B站 Cookie',
@@ -175,13 +179,14 @@ export class Scheduler {
         throw error;
       }
     }
+    const dynamics = feed.items;
     let detailBudget = (initializing || fullSync) ? Number.POSITIVE_INFINITY : 20;
     let detailsFetched = 0;
     for (const dynamic of dynamics) {
-      const existing = getDb().prepare('SELECT text,raw_excerpt FROM dynamics WHERE id=?').get(dynamic.id) as Row | undefined;
+      const existing = getDynamic(dynamic.id);
       let enriched = dynamic;
       if (detailBudget > 0 && (initializing || fullSync || !existing || !String(existing.text ?? '').trim() ||
-        (String(existing.text ?? '').includes('[') && !String(existing.raw_excerpt ?? '').includes('"emojiMap"')))) {
+        (String(existing.text ?? '').includes('[') && Object.keys(existing.emojiMap ?? {}).length === 0))) {
         try {
           // 添加延迟以避免触发B站风控（第一个请求不延迟）
           if (detailsFetched > 0) {
@@ -195,7 +200,14 @@ export class Scheduler {
         } catch (error) {
           // 只在非412错误时创建告警，避免告警泛滥
           if (!(error instanceof BilibiliError && (error.code === -412 || error.status === 412))) {
-            upsertAlert(`dynamic-detail:${dynamic.id}`, 'info', '动态详情解析失败', formatError(error));
+            upsertAlert(`dynamic-detail:${streamerId}`, 'info', '动态详情解析失败',
+              `主播 ${String(streamer.name)} 的动态 ${dynamic.id}：${formatError(error)}`);
+          }
+          if (existing) {
+            const archived = (existing.text.trim() || existing.media.length > 0 || Object.keys(existing.emojiMap ?? {}).length > 0)
+              ? { text: existing.text, mediaUrls: existing.media.map((item) => item.sourceUrl), emojiMap: existing.emojiMap ?? {} }
+              : getLatestCompleteDynamicSnapshot(dynamic.id);
+            if (archived) enriched = { ...dynamic, ...archived };
           }
         }
         detailBudget -= 1;
@@ -203,14 +215,14 @@ export class Scheduler {
       upsertDynamic({ ...enriched, streamerId });
       if (dynamic.avatarUrl) getDb().prepare('UPDATE streamers SET avatar_url=COALESCE(avatar_url,?),updated_at=? WHERE id=?').run(dynamic.avatarUrl, new Date().toISOString(), streamerId);
     }
-    if (initializing || fullSync) markMissingDynamicsDeleted(streamerId, dynamics.map((item) => item.id), since.toISOString());
+    if ((initializing || fullSync) && feed.complete) markMissingDynamicsDeleted(streamerId, dynamics.map((item) => item.id), since.toISOString());
     if (initializing || fullSync) getDb().prepare('UPDATE streamers SET dynamic_history_initialized_at=COALESCE(dynamic_history_initialized_at,?),last_dynamic_full_sync_at=?,updated_at=? WHERE id=?')
       .run(new Date().toISOString(), new Date().toISOString(), new Date().toISOString(), streamerId);
     getDb().prepare('UPDATE streamers SET last_dynamic_sync_at=?,updated_at=? WHERE id=?')
       .run(new Date().toISOString(), new Date().toISOString(), streamerId);
   }
 
-  private async syncComments(dynamicId: string): Promise<void> {
+  private async syncComments(dynamicId: string, payload: Row = {}): Promise<void> {
     const dynamic = getDb().prepare(`SELECT d.*,s.bili_uid FROM dynamics d JOIN streamers s ON s.id=d.streamer_id WHERE d.id=?`)
       .get(dynamicId) as Row | undefined;
     if (!dynamic) return;
@@ -237,8 +249,9 @@ export class Scheduler {
       getDb().prepare('UPDATE dynamics SET comment_oid=?,comment_type=? WHERE id=?').run(oid, type, dynamicId);
     }
     let offset = state && !Number(state.is_complete) ? String(state.offset ?? '') : '';
-    const initialOffset = offset;
-    const seenRootIds: string[] = [];
+    const fullScan = payload.fullScan === true || (!offset && !Array.isArray(payload.seenRootIds));
+    const seenRootIds = Array.isArray(payload.seenRootIds) ? payload.seenRootIds.map(String) : [];
+    const scanId = String(payload.scanId ?? Date.now());
     let complete = false;
     for (let pageIndex = 0; pageIndex < 10; pageIndex += 1) {
       if (pageIndex > 0) await delay(config.commentPageDelayMs + Math.floor(Math.random() * 500));
@@ -253,7 +266,7 @@ export class Scheduler {
         const total = Number(top.rcount ?? 0);
         if (total > loaded) {
           enqueueJob('sync_sub_replies', dynamicId, { dynamicId, oid, type, rootId, totalPages: Math.ceil(total / 20), startPage: 1,
-            streamerUid: String(dynamic.bili_uid) }, 60, new Date().toISOString(), `sub:${dynamicId}:${rootId}:1`);
+            streamerUid: String(dynamic.bili_uid), scanId }, 60, new Date().toISOString(), `sub:${dynamicId}:${rootId}:${scanId}:1`);
         }
       }
       offset = page.nextOffset;
@@ -265,10 +278,11 @@ export class Scheduler {
       next_sync_at=?,last_error=NULL,updated_at=? WHERE dynamic_id=?`)
       .run(complete ? null : offset, complete ? 1 : 0, complete ? 1 : 0, new Date().toISOString(), nextSyncAt,
         new Date().toISOString(), dynamicId);
-    if (complete && !initialOffset) markMissingRootCommentsUnavailable(dynamicId, seenRootIds);
+    if (complete && fullScan) markMissingRootCommentsUnavailable(dynamicId, [...new Set(seenRootIds)]);
     getDb().prepare('UPDATE streamers SET last_comment_sync_at=? WHERE id=?').run(new Date().toISOString(), dynamic.streamer_id);
-    if (!complete) enqueueJob('sync_comments', dynamicId, {}, 55, new Date(Date.now() + 5000).toISOString(), `comments:${dynamicId}:continue:${offset}`);
-    else enqueueJob('sync_comments', dynamicId, {}, 90, nextSyncAt, `comments:${dynamicId}:next:${nextSyncAt.slice(0, 13)}`);
+    if (!complete) enqueueJob('sync_comments', dynamicId, { fullScan, seenRootIds: [...new Set(seenRootIds)], scanId }, 55,
+      new Date(Date.now() + 5000).toISOString(), `comments:${dynamicId}:continue:${offset}`);
+    else enqueueJob('sync_comments', dynamicId, {}, 90, nextSyncAt, `comments:${dynamicId}:next:${nextSyncAt}`);
   }
 
   private async syncSubReplies(payload: Row): Promise<void> {
@@ -287,7 +301,8 @@ export class Scheduler {
     };
     const start = Number(payload.startPage ?? 1);
     const end = Math.min(Number(payload.totalPages ?? start), start + 9);
-    const seenIds: string[] = [];
+    const fullScan = payload.fullScan === true || (start === 1 && !Array.isArray(payload.seenIds));
+    const seenIds = Array.isArray(payload.seenIds) ? payload.seenIds.map(String) : [];
     for (let page = start; page <= end; page += 1) {
       if (page > start) await delay(config.commentPageDelayMs + Math.floor(Math.random() * 500));
       const comments = await callWithCookieFallback((activeClient) => activeClient.fetchSubReplies(String(payload.oid), String(payload.type), String(payload.rootId), page));
@@ -295,12 +310,13 @@ export class Scheduler {
         upsertComment({ ...comment, dynamicId: String(payload.dynamicId), isStreamer: comment.authorUid === String(payload.streamerUid) });
         seenIds.push(comment.id);
       }
-      if (start === 1 && end >= Number(payload.totalPages)) markMissingRepliesUnavailable(String(payload.dynamicId), String(payload.rootId), seenIds);
     }
     if (end < Number(payload.totalPages)) {
       const next = end + 1;
-      enqueueJob('sync_sub_replies', String(payload.dynamicId), { ...payload, startPage: next }, 65,
-        new Date(Date.now() + 5000).toISOString(), `sub:${payload.dynamicId}:${payload.rootId}:${next}`);
+      enqueueJob('sync_sub_replies', String(payload.dynamicId), { ...payload, startPage: next, fullScan, seenIds: [...new Set(seenIds)] }, 65,
+        new Date(Date.now() + 5000).toISOString(), `sub:${payload.dynamicId}:${payload.rootId}:${payload.scanId}:${next}`);
+    } else if (fullScan) {
+      markMissingRepliesUnavailable(String(payload.dynamicId), String(payload.rootId), [...new Set(seenIds)]);
     }
   }
 
