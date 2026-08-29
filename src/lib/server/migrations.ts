@@ -375,5 +375,95 @@ export const migrations = [
     sql: `
       ALTER TABLE streamers ADD COLUMN last_dynamic_full_sync_at TEXT;
     `
+  },
+  {
+    version: 6,
+    sql: `
+      ALTER TABLE streamers ADD COLUMN resolved_room_id TEXT;
+      ALTER TABLE streamers ADD COLUMN room_short_id TEXT;
+      ALTER TABLE streamers ADD COLUMN room_mapping_status TEXT NOT NULL DEFAULT 'unverified';
+      ALTER TABLE streamers ADD COLUMN room_mapping_checked_at TEXT;
+
+      ALTER TABLE dynamics ADD COLUMN content_quality TEXT NOT NULL DEFAULT 'feed';
+      ALTER TABLE dynamics ADD COLUMN detail_fetched_at TEXT;
+      ALTER TABLE dynamics ADD COLUMN missing_complete_scans INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE dynamics ADD COLUMN last_missing_scan_id TEXT;
+      ALTER TABLE dynamics ADD COLUMN first_missing_at TEXT;
+      ALTER TABLE dynamics ADD COLUMN deletion_confirmed_at TEXT;
+      CREATE INDEX idx_dynamics_state_missing ON dynamics(streamer_id, state, missing_complete_scans, published_at DESC);
+      CREATE INDEX idx_dynamic_revisions_dynamic_created ON dynamic_revisions(dynamic_id, created_at DESC);
+      CREATE INDEX idx_comment_revisions_comment_created ON comment_revisions(comment_id, created_at DESC);
+
+      ALTER TABLE forecasts ADD COLUMN uncertainty_minutes INTEGER;
+
+      CREATE TABLE media_source_aliases (
+        source_url TEXT PRIMARY KEY,
+        media_id TEXT NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_media_source_alias_asset ON media_source_aliases(media_id);
+
+      ALTER TABLE dynamic_media ADD COLUMN source_url TEXT;
+      ALTER TABLE comment_media ADD COLUMN source_url TEXT;
+
+      CREATE TABLE schedule_drafts (
+        id TEXT PRIMARY KEY,
+        streamer_id TEXT NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
+        dynamic_id TEXT NOT NULL REFERENCES dynamics(id) ON DELETE CASCADE,
+        content_hash TEXT NOT NULL,
+        source_text TEXT NOT NULL DEFAULT '',
+        media_urls_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'pending',
+        model TEXT,
+        raw_result_json TEXT,
+        entries_json TEXT NOT NULL DEFAULT '[]',
+        error TEXT,
+        reviewed_at TEXT,
+        reviewed_by TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(dynamic_id, content_hash)
+      );
+      CREATE INDEX idx_schedule_drafts_status ON schedule_drafts(status, created_at DESC);
+
+      CREATE TABLE timeline_events (
+        id TEXT PRIMARY KEY,
+        streamer_id TEXT NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
+        event_type TEXT NOT NULL,
+        planned_start_at TEXT,
+        occurred_at TEXT,
+        source_type TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        title TEXT,
+        confidence INTEGER NOT NULL CHECK(confidence BETWEEN 0 AND 100),
+        active INTEGER NOT NULL DEFAULT 1,
+        event_key TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_timeline_events_streamer_time ON timeline_events(streamer_id, active, planned_start_at, occurred_at);
+
+      CREATE TABLE prediction_evaluations (
+        id TEXT PRIMARY KEY,
+        streamer_id TEXT NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
+        forecast_id TEXT REFERENCES forecasts(id) ON DELETE SET NULL,
+        live_session_id TEXT REFERENCES live_sessions(id) ON DELETE SET NULL,
+        outcome TEXT NOT NULL,
+        predicted_start_at TEXT,
+        actual_start_at TEXT,
+        error_minutes REAL,
+        lead_minutes REAL,
+        source TEXT,
+        within_30 INTEGER,
+        within_60 INTEGER,
+        created_at TEXT NOT NULL,
+        UNIQUE(forecast_id, live_session_id, outcome)
+      );
+      CREATE INDEX idx_prediction_evaluations_streamer ON prediction_evaluations(streamer_id, created_at DESC);
+      CREATE UNIQUE INDEX idx_prediction_no_show_once ON prediction_evaluations(forecast_id, outcome)
+        WHERE outcome='no_show';
+      CREATE UNIQUE INDEX idx_prediction_missed_session_once ON prediction_evaluations(live_session_id, outcome)
+        WHERE outcome='missed';
+    `
   }
 ] as const;

@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import type { CommentRecord, DynamicRecord, ForecastRecord, LiveStatus, MediaAsset, StreamerSummary } from '$lib/types';
+import type { ArchiveCursor, CommentRecord, DynamicRecord, ForecastRecord, LiveStatus, MediaAsset, ScheduleDraftEntry, StreamerSummary } from '$lib/types';
 import { config } from './config';
 import { getDb, withTransaction } from './db';
+import type { SQLInputValue } from 'node:sqlite';
 import { contentHash, createOpaqueToken, decryptSecret, encryptSecret, hashPassword, hashToken } from './security';
 
 type Row = Record<string, unknown>;
@@ -40,6 +41,48 @@ export interface NormalizedDynamicInput {
   rawExcerpt?: string | null;
   emojiMap?: Record<string, string>;
   avatarUrl?: string | null;
+  contentQuality?: 'feed' | 'detail' | 'restored';
+  detailFetchedAt?: string | null;
+}
+
+export interface DynamicFilters {
+  q?: string;
+  from?: string;
+  to?: string;
+  type?: string;
+  state?: DynamicRecord['state'];
+  hasMedia?: boolean;
+  changedOnly?: boolean;
+}
+
+export interface ScheduleDraftRecord {
+  id: string;
+  streamerId: string;
+  streamerName: string;
+  dynamicId: string;
+  dynamicText: string;
+  publishedAt: string;
+  contentHash: string;
+  mediaUrls: string[];
+  status: string;
+  model: string | null;
+  rawResult: unknown;
+  entries: ScheduleDraftEntry[];
+  error: string | null;
+  reviewedAt: string | null;
+  reviewedBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+  confirmedCount: number;
+}
+
+export interface PredictionEvaluationSummary {
+  count: number;
+  ready: boolean;
+  mae: number | null;
+  within30: number | null;
+  within60: number | null;
+  bySource: Record<string, { count: number; mae: number; within30: number; within60: number }>;
 }
 
 export interface DynamicRevisionRecord {
@@ -120,11 +163,15 @@ export async function changeAdminPassword(adminId: string, password: string, act
 
 export function listStreamerSummaries(): StreamerSummary[] {
   const rows = getDb().prepare(`
-    SELECT s.id, s.slug, s.name, s.bili_uid, s.room_id, s.avatar_url,
+    SELECT s.id, s.slug, s.name, s.bili_uid, s.room_id, s.resolved_room_id, s.room_short_id, s.room_mapping_status, s.avatar_url,
            COALESCE(ls.status, 'unknown') AS live_status, ls.title AS live_title,
            ls.checked_at,
            f.predicted_start_at, f.confidence, f.source AS forecast_source,
-           f.reason AS forecast_reason, f.stale AS forecast_stale
+            f.reason AS forecast_reason, f.stale AS forecast_stale, f.uncertainty_minutes,
+            (EXISTS(SELECT 1 FROM schedule_exceptions se WHERE se.streamer_id=s.id AND se.occurrence_date=date('now','localtime')
+              AND se.status='cancelled') OR EXISTS(SELECT 1 FROM timeline_events te WHERE te.streamer_id=s.id AND te.active=1
+              AND te.event_type='cancelled' AND date(COALESCE(te.planned_start_at,te.occurred_at,te.created_at),'localtime')=date('now','localtime')))
+              AND COALESCE(f.source,'')!='manual' AS cancelled_today
     FROM streamers s
     LEFT JOIN live_state ls ON ls.streamer_id = s.id
     LEFT JOIN forecasts f ON f.id = (
@@ -156,7 +203,11 @@ export function getStreamerBySlug(slug: string): (StreamerSummary & { timezone: 
   const row = getDb().prepare(`
     SELECT s.*, COALESCE(ls.status, 'unknown') AS live_status, ls.title AS live_title, ls.checked_at,
            f.predicted_start_at, f.confidence, f.source AS forecast_source, f.reason AS forecast_reason,
-           f.stale AS forecast_stale
+           f.stale AS forecast_stale, f.uncertainty_minutes,
+           (EXISTS(SELECT 1 FROM schedule_exceptions se WHERE se.streamer_id=s.id AND se.occurrence_date=date('now','localtime')
+             AND se.status='cancelled') OR EXISTS(SELECT 1 FROM timeline_events te WHERE te.streamer_id=s.id AND te.active=1
+             AND te.event_type='cancelled' AND date(COALESCE(te.planned_start_at,te.occurred_at,te.created_at),'localtime')=date('now','localtime')))
+             AND COALESCE(f.source,'')!='manual' AS cancelled_today
     FROM streamers s
     LEFT JOIN live_state ls ON ls.streamer_id = s.id
     LEFT JOIN forecasts f ON f.id = (
@@ -236,32 +287,62 @@ export function updateStreamer(id: string, input: Partial<StreamerInput>, expect
       WHERE id=? AND version=?`).run(after.slug, after.name, after.biliUid, after.roomId, after.dynamicUrl, after.liveUrl,
       after.avatarUrl, after.timezone, after.enabled, after.livePollSeconds, after.dynamicPollSeconds, now(), id, expectedVersion);
     if (Number(result.changes) !== 1) throw new Error('配置版本冲突');
+    if (String(before.room_id) !== after.roomId || String(before.bili_uid) !== after.biliUid) {
+      db.prepare(`UPDATE streamers SET resolved_room_id=NULL,room_short_id=NULL,room_mapping_status='unverified',
+        room_mapping_checked_at=NULL WHERE id=?`).run(id);
+    }
     insertAudit(db, actor, null, 'streamer.update', 'streamer', id, before, after);
   });
 }
 
-export function listDynamics(streamerId: string, limit = 20, before?: string): DynamicRecord[] {
+export function listDynamicsPage(streamerId: string, limit = 30, cursor?: string, filters: DynamicFilters = {}): {
+  items: DynamicRecord[]; nextCursor: string | null;
+} {
   const safeLimit = clamp(limit, 1, 50);
-  const rows = getDb().prepare(`SELECT * FROM dynamics WHERE streamer_id = ? AND (? IS NULL OR published_at < ?)
-                                ORDER BY published_at DESC, id DESC LIMIT ?`)
-    .all(streamerId, before ?? null, before ?? null, safeLimit) as Row[];
-  return rows.map((row) => ({
+  const decoded = decodeArchiveCursor(cursor);
+  const clauses = ['d.streamer_id = ?'];
+  const params: SQLInputValue[] = [streamerId];
+  if (decoded) {
+    clauses.push('(d.published_at < ? OR (d.published_at = ? AND d.id < ?))');
+    params.push(decoded.publishedAt, decoded.publishedAt, decoded.id);
+  }
+  if (filters.q) { clauses.push("d.text LIKE ? ESCAPE '\\'"); params.push(`%${escapeLike(filters.q)}%`); }
+  if (filters.from) { clauses.push('d.published_at >= ?'); params.push(new Date(`${filters.from}T00:00:00+08:00`).toISOString()); }
+  if (filters.to) { clauses.push('d.published_at <= ?'); params.push(new Date(`${filters.to}T23:59:59.999+08:00`).toISOString()); }
+  if (filters.type) { clauses.push('d.type = ?'); params.push(filters.type); }
+  if (filters.state) { clauses.push('d.state = ?'); params.push(filters.state); }
+  if (filters.hasMedia) clauses.push('EXISTS(SELECT 1 FROM dynamic_media dm WHERE dm.dynamic_id=d.id)');
+  if (filters.changedOnly) clauses.push('EXISTS(SELECT 1 FROM dynamic_revisions dr WHERE dr.dynamic_id=d.id)');
+  const rows = getDb().prepare(`SELECT d.* FROM dynamics d WHERE ${clauses.join(' AND ')}
+    ORDER BY d.published_at DESC, d.id DESC LIMIT ?`).all(...params, safeLimit + 1) as Row[];
+  const pageRows = rows.slice(0, safeLimit);
+  const items = pageRows.map(rowToDynamic);
+  const last = pageRows.at(-1);
+  return { items, nextCursor: rows.length > safeLimit && last
+    ? encodeArchiveCursor({ publishedAt: String(last.published_at), id: String(last.id) }) : null };
+}
+
+export function listDynamics(streamerId: string, limit = 20, before?: string): DynamicRecord[] {
+  if (before && !decodeArchiveCursor(before)) {
+    const rows = getDb().prepare(`SELECT * FROM dynamics WHERE streamer_id=? AND published_at < ? ORDER BY published_at DESC,id DESC LIMIT ?`)
+      .all(streamerId, before, clamp(limit, 1, 50)) as Row[];
+    return rows.map(rowToDynamic);
+  }
+  return listDynamicsPage(streamerId, limit, before).items;
+}
+
+function rowToDynamic(row: Row): DynamicRecord {
+  return {
     id: String(row.id), streamerId: String(row.streamer_id), type: String(row.type), text: String(row.text),
     sourceUrl: String(row.source_url), state: String(row.state) as DynamicRecord['state'],
     publishedAt: String(row.published_at), updatedAt: String(row.updated_at), commentCount: number(row.comment_count),
     likeCount: number(row.like_count), media: listMediaFor('dynamic', String(row.id)), emojiMap: parseEmojiMap(row.raw_excerpt)
-  }));
+  };
 }
 
 export function getDynamic(id: string): DynamicRecord | null {
   const row = getDb().prepare('SELECT * FROM dynamics WHERE id = ?').get(id) as Row | undefined;
-  if (!row) return null;
-  return {
-    id: String(row.id), streamerId: String(row.streamer_id), type: String(row.type), text: String(row.text),
-    sourceUrl: String(row.source_url), state: String(row.state) as DynamicRecord['state'], publishedAt: String(row.published_at),
-    updatedAt: String(row.updated_at), commentCount: number(row.comment_count), likeCount: number(row.like_count),
-    media: listMediaFor('dynamic', id), emojiMap: parseEmojiMap(row.raw_excerpt)
-  };
+  return row ? rowToDynamic(row) : null;
 }
 
 export function listDynamicRevisions(id: string): DynamicRevisionRecord[] {
@@ -295,13 +376,22 @@ export function getDynamicRevision(id: string, revisionId: string): DynamicRevis
 }
 
 export function markDynamicDeleted(id: string): void {
-  getDb().prepare("UPDATE dynamics SET state='deleted',updated_at=? WHERE id=? AND state='visible'").run(now(), id);
+  getDb().prepare("UPDATE dynamics SET state='deleted',missing_complete_scans=MAX(missing_complete_scans,2),deletion_confirmed_at=?,updated_at=? WHERE id=?")
+    .run(now(), now(), id);
 }
 
-export function markMissingDynamicsDeleted(streamerId: string, seenIds: string[], since: string): number {
+export function markMissingDynamicsDeleted(streamerId: string, seenIds: string[], since: string, scanId: string = randomUUID()): number {
   const exclusion = seenIds.length ? ` AND id NOT IN (${seenIds.map(() => '?').join(',')})` : '';
-  const result = getDb().prepare(`UPDATE dynamics SET state='deleted',updated_at=? WHERE streamer_id=? AND published_at>=? AND state='visible'${exclusion}`)
-    .run(now(), streamerId, since, ...seenIds);
+  const timestamp = now();
+  const result = getDb().prepare(`UPDATE dynamics SET
+      missing_complete_scans=missing_complete_scans+1,
+      last_missing_scan_id=?, first_missing_at=COALESCE(first_missing_at,?),
+      state=CASE WHEN missing_complete_scans+1 >= 2 THEN 'deleted' ELSE 'suspected_deleted' END,
+      deletion_confirmed_at=CASE WHEN missing_complete_scans+1 >= 2 THEN ? ELSE deletion_confirmed_at END,
+      updated_at=?
+    WHERE streamer_id=? AND published_at>=? AND state IN ('visible','suspected_deleted')
+      AND (last_missing_scan_id IS NULL OR last_missing_scan_id != ?)${exclusion}`)
+    .run(scanId, timestamp, timestamp, timestamp, streamerId, since, scanId, ...seenIds);
   return Number(result.changes);
 }
 
@@ -330,11 +420,24 @@ export function markMissingRepliesUnavailable(dynamicId: string, rootId: string,
   return Number(result.changes);
 }
 
+export function listCommentsPage(dynamicId: string, limit = 50, cursor?: string): { items: CommentRecord[]; nextCursor: string | null } {
+  const decoded = decodeArchiveCursor(cursor);
+  const safeLimit = clamp(limit, 1, 100);
+  const rows = getDb().prepare(`SELECT * FROM comments WHERE dynamic_id=? AND root_id IS NULL
+    AND (? IS NULL OR published_at < ? OR (published_at=? AND id<?)) ORDER BY published_at DESC,id DESC LIMIT ?`)
+    .all(dynamicId, decoded?.publishedAt ?? null, decoded?.publishedAt ?? null, decoded?.publishedAt ?? null, decoded?.id ?? null, safeLimit + 1) as Row[];
+  const pageRows = rows.slice(0, safeLimit);
+  const last = pageRows.at(-1);
+  return { items: pageRows.map(rowToComment), nextCursor: rows.length > safeLimit && last
+    ? encodeArchiveCursor({ publishedAt: String(last.published_at), id: String(last.id) }) : null };
+}
+
 export function listComments(dynamicId: string, limit = 50, before?: string): CommentRecord[] {
-  const rows = getDb().prepare(`SELECT * FROM comments WHERE dynamic_id = ? AND root_id IS NULL
-                                AND (? IS NULL OR published_at < ?) ORDER BY published_at DESC, id DESC LIMIT ?`)
-    .all(dynamicId, before ?? null, before ?? null, clamp(limit, 1, 100)) as Row[];
-  return rows.map(rowToComment);
+  if (before && !decodeArchiveCursor(before)) {
+    return (getDb().prepare(`SELECT * FROM comments WHERE dynamic_id=? AND root_id IS NULL AND published_at<?
+      ORDER BY published_at DESC,id DESC LIMIT ?`).all(dynamicId, before, clamp(limit, 1, 100)) as Row[]).map(rowToComment);
+  }
+  return listCommentsPage(dynamicId, limit, before).items;
 }
 
 export function countRootComments(dynamicId: string): number {
@@ -353,36 +456,44 @@ export function upsertDynamic(input: NormalizedDynamicInput): { created: boolean
   const hash = contentHash({ type: input.type, text: input.text, media: input.mediaUrls ?? [], emojiMap: input.emojiMap ?? {} });
   const existing = db.prepare('SELECT * FROM dynamics WHERE id = ?').get(input.id) as Row | undefined;
   let changed = false;
+  let effectiveQuality = input.contentQuality ?? 'feed';
   withTransaction((tx) => {
     if (!existing) {
       tx.prepare(`INSERT INTO dynamics(id, streamer_id, type, text, source_url, published_at, updated_at, last_seen_at,
-        content_hash, comment_oid, comment_type, comment_count, like_count, raw_excerpt)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        content_hash, comment_oid, comment_type, comment_count, like_count, raw_excerpt,content_quality,detail_fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(input.id, input.streamerId, input.type, input.text, input.sourceUrl, input.publishedAt, timestamp, timestamp,
           hash, input.commentOid ?? null, input.commentType ?? null, input.commentCount ?? 0, input.likeCount ?? 0,
-          mergeRawExcerpt(input.rawExcerpt, input.emojiMap));
+          mergeRawExcerpt(input.rawExcerpt, input.emojiMap), input.contentQuality ?? 'feed', input.detailFetchedAt ?? null);
       tx.prepare(`INSERT INTO comment_sync_state(dynamic_id, next_sync_at, updated_at) VALUES (?, ?, ?)`)
         .run(input.id, timestamp, timestamp);
       changed = true;
     } else {
       changed = String(existing.content_hash) !== hash;
+      if (!changed && effectiveQuality === 'feed' && ['detail', 'restored'].includes(String(existing.content_quality))) {
+        effectiveQuality = String(existing.content_quality) as 'detail' | 'restored';
+      }
       if (changed) {
-        const oldMedia = tx.prepare('SELECT m.source_url FROM media_assets m JOIN dynamic_media dm ON dm.media_id=m.id WHERE dm.dynamic_id=? ORDER BY dm.position').all(input.id) as Row[];
+        const oldMedia = tx.prepare(`SELECT COALESCE(dm.source_url,m.source_url) AS source_url FROM media_assets m
+          JOIN dynamic_media dm ON dm.media_id=m.id WHERE dm.dynamic_id=? ORDER BY dm.position`).all(input.id) as Row[];
         const snapshot = { ...existing, mediaUrls: oldMedia.map((row) => String(row.source_url)) };
         tx.prepare(`INSERT INTO dynamic_revisions(id, dynamic_id, text, content_hash, snapshot_json, created_at)
                     VALUES (?, ?, ?, ?, ?, ?)`)
           .run(randomUUID(), input.id, String(existing.text), String(existing.content_hash), JSON.stringify(snapshot), timestamp);
       }
       tx.prepare(`UPDATE dynamics SET type=?, text=?, source_url=?, state='visible', updated_at=?, last_seen_at=?,
-                  content_hash=?, comment_oid=COALESCE(?, comment_oid), comment_type=COALESCE(?, comment_type),
-                  comment_count=?, like_count=?, raw_excerpt=? WHERE id=?`)
+                   content_hash=?, comment_oid=COALESCE(?, comment_oid), comment_type=COALESCE(?, comment_type),
+                   comment_count=?, like_count=?, raw_excerpt=?,content_quality=?,detail_fetched_at=COALESCE(?,detail_fetched_at),
+                   missing_complete_scans=0,last_missing_scan_id=NULL,first_missing_at=NULL,deletion_confirmed_at=NULL WHERE id=?`)
         .run(input.type, input.text, input.sourceUrl, timestamp, timestamp, hash, input.commentOid ?? null,
-          input.commentType ?? null, input.commentCount ?? 0, input.likeCount ?? 0, mergeRawExcerpt(input.rawExcerpt, input.emojiMap), input.id);
+          input.commentType ?? null, input.commentCount ?? 0, input.likeCount ?? 0, mergeRawExcerpt(input.rawExcerpt, input.emojiMap),
+          effectiveQuality, input.detailFetchedAt ?? null, input.id);
     }
     tx.prepare('DELETE FROM dynamic_media WHERE dynamic_id=?').run(input.id);
     linkMediaUrls(tx, 'dynamic', input.id, input.mediaUrls ?? []);
   });
   if (!existing || changed) enqueueJob('pi_analyze', input.streamerId, { dynamicId: input.id }, 30, timestamp, `pi-dynamic:${input.id}:${hash}`);
+  if ((!existing || changed) && isScheduleCandidate(input.text, input.mediaUrls ?? [])) createScheduleDraftCandidate(input.streamerId, input.id, hash, input.mediaUrls ?? []);
   if (!existing) enqueueJob('sync_comments', input.id, {}, 50, timestamp, `comments:${input.id}:initial`);
   return { created: !existing, changed };
 }
@@ -425,24 +536,32 @@ export function upsertComment(input: NormalizedCommentInput): { created: boolean
   return { created: !existing, changed, highSignal };
 }
 
-export function setForecast(input: Omit<ForecastRecord, 'id' | 'createdAt' | 'stale'> & { stale?: boolean }, actor = 'pi'): string {
+export function setForecast(input: Omit<ForecastRecord, 'id' | 'createdAt' | 'stale' | 'uncertaintyMinutes'> & {
+  stale?: boolean; uncertaintyMinutes?: number | null
+}, actor = 'pi'): string {
   if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 100) throw new Error('置信度必须在 0 到 100 之间');
   const predicted = new Date(input.predictedStartAt);
   if (Number.isNaN(predicted.getTime())) throw new Error('预测时间格式无效');
   if (predicted.getTime() < Date.now() - 60_000) throw new Error('预测时间必须是未来时间');
   if (predicted.getTime() > Date.now() + 8 * 24 * 60 * 60 * 1000) throw new Error('预测时间不能超过未来 8 天');
-  const manual = getDb().prepare(`SELECT id FROM forecasts WHERE streamer_id=? AND active=1 AND source='manual' LIMIT 1`)
-    .get(input.streamerId);
+  const manual = getDb().prepare(`SELECT id FROM forecasts WHERE streamer_id=? AND active=1 AND source='manual'
+    AND stale=0 AND predicted_start_at>? LIMIT 1`).get(input.streamerId, now());
   if (manual && input.source !== 'manual') throw new Error('人工预测已锁定');
+  const active = getDb().prepare('SELECT source,stale,predicted_start_at FROM forecasts WHERE streamer_id=? AND active=1 ORDER BY created_at DESC LIMIT 1')
+    .get(input.streamerId) as Row | undefined;
+  if (active && !bool(active.stale) && String(active.predicted_start_at) > now() &&
+    forecastPriority(String(active.source)) > forecastPriority(input.source)) {
+    throw new Error('当前存在更高优先级的有效预测');
+  }
   const id = randomUUID();
   withTransaction((db) => {
     const before = db.prepare('SELECT * FROM forecasts WHERE streamer_id=? AND active=1 ORDER BY created_at DESC LIMIT 1')
       .get(input.streamerId) as Row | undefined;
     db.prepare('UPDATE forecasts SET active=0 WHERE streamer_id=? AND active=1').run(input.streamerId);
-    db.prepare(`INSERT INTO forecasts(id, streamer_id, predicted_start_at, confidence, source, reason, evidence_json, stale, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    db.prepare(`INSERT INTO forecasts(id, streamer_id, predicted_start_at, confidence, source, reason, evidence_json, stale,
+                uncertainty_minutes,created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(id, input.streamerId, predicted.toISOString(), Math.round(input.confidence), input.source, input.reason,
-        JSON.stringify(input.evidence), input.stale ? 1 : 0, now());
+        JSON.stringify(input.evidence), input.stale ? 1 : 0, input.uncertaintyMinutes == null ? null : clamp(input.uncertaintyMinutes, 0, 720), now());
     insertAudit(db, actor, null, 'forecast.set', 'forecast', id, before ?? null, input);
   });
   return id;
@@ -451,18 +570,22 @@ export function setForecast(input: Omit<ForecastRecord, 'id' | 'createdAt' | 'st
 export function rollOverdueForecasts(): number {
   const rows = getDb().prepare(`SELECT f.*, ls.status FROM forecasts f
     LEFT JOIN live_state ls ON ls.streamer_id=f.streamer_id
-    WHERE f.active=1 AND f.source!='manual' AND f.predicted_start_at <= ?
+    WHERE f.active=1 AND f.stale=0 AND f.predicted_start_at <= ?
       AND COALESCE(ls.status, 'offline') != 'live'`).all(now()) as Row[];
   for (const row of rows) {
-    const next = new Date(Math.ceil((Date.now() + 1) / 300000) * 300000);
-    setForecast({
-      streamerId: String(row.streamer_id), predictedStartAt: next.toISOString(),
-      confidence: Math.max(1, number(row.confidence) - 5), source: 'fallback',
-      reason: '预测时间已过且仍未开播，系统顺延至下一个 5 分钟刻度。',
-      evidence: safeJson(String(row.evidence_json), [])
-    }, 'scheduler');
-    enqueueJob('pi_analyze', String(row.streamer_id), { reason: 'forecast_overdue' }, 15, now(), `pi-overdue:${row.streamer_id}:${next.toISOString()}`);
+    getDb().prepare('UPDATE forecasts SET stale=1 WHERE id=?').run(String(row.id));
+    enqueueJob('pi_analyze', String(row.streamer_id), { reason: 'forecast_overdue' }, 15, now(), `pi-overdue:${row.id}`);
+    const noShowAt = new Date(String(row.predicted_start_at)).getTime() + 6 * 3600_000;
+    if (Date.now() >= noShowAt) recordNoShowEvaluation(String(row.id));
+    if (['schedule_confirmed', 'weekly_schedule'].includes(String(row.source))) refreshForecastFromSchedules(String(row.streamer_id));
   }
+  const noShows = getDb().prepare(`SELECT f.* FROM forecasts f LEFT JOIN live_state ls ON ls.streamer_id=f.streamer_id
+    WHERE f.predicted_start_at<=? AND COALESCE(ls.status,'offline')!='live'
+      AND NOT EXISTS(SELECT 1 FROM prediction_evaluations pe WHERE pe.forecast_id=f.id)
+      AND NOT EXISTS(SELECT 1 FROM live_sessions session WHERE session.streamer_id=f.streamer_id
+        AND julianday(session.observed_start_at) BETWEEN julianday(f.predicted_start_at)-0.25 AND julianday(f.predicted_start_at)+0.25)`)
+    .all(new Date(Date.now() - 6 * 3600_000).toISOString()) as Row[];
+  for (const row of noShows) recordNoShowEvaluation(String(row.id));
   return rows.length;
 }
 
@@ -477,12 +600,21 @@ export function updateLiveState(streamerId: string, status: LiveStatus, title: s
       changed_at=CASE WHEN live_state.status != excluded.status THEN excluded.changed_at ELSE live_state.changed_at END`)
       .run(streamerId, status, normalizedTitle, timestamp, timestamp);
     if (changed && status === 'live') {
+      const sessionId = randomUUID();
       db.prepare(`INSERT INTO live_sessions(id, streamer_id, title, observed_start_at, created_at) VALUES (?, ?, ?, ?, ?)`)
-        .run(randomUUID(), streamerId, normalizedTitle, timestamp, timestamp);
+        .run(sessionId, streamerId, normalizedTitle, timestamp, timestamp);
+      upsertTimelineEventInTransaction(db, { streamerId, eventType: 'live_started', occurredAt: timestamp, sourceType: 'live_session',
+        sourceId: sessionId, title: normalizedTitle ?? undefined, confidence: 100 });
+      evaluateLiveStartInTransaction(db, streamerId, sessionId, timestamp);
     }
     if (changed && status !== 'live' && before?.status === 'live') {
-      db.prepare(`UPDATE live_sessions SET observed_end_at=? WHERE id=(SELECT id FROM live_sessions
-        WHERE streamer_id=? AND observed_end_at IS NULL ORDER BY observed_start_at DESC LIMIT 1)`).run(timestamp, streamerId);
+      const session = db.prepare(`SELECT id FROM live_sessions WHERE streamer_id=? AND observed_end_at IS NULL
+        ORDER BY observed_start_at DESC LIMIT 1`).get(streamerId) as Row | undefined;
+      if (session) {
+        db.prepare('UPDATE live_sessions SET observed_end_at=? WHERE id=?').run(timestamp, String(session.id));
+        upsertTimelineEventInTransaction(db, { streamerId, eventType: 'live_ended', occurredAt: timestamp, sourceType: 'live_session',
+          sourceId: String(session.id), confidence: 100 });
+      }
     }
   });
   if (changed) enqueueJob('pi_analyze', streamerId, { liveStatus: status }, 5, timestamp, `pi-live:${streamerId}:${status}:${timestamp.slice(0, 16)}`);
@@ -669,6 +801,175 @@ export function replacePiScheduleRules(streamerId: string, rules: Array<{ weekda
   });
 }
 
+export function updateRoomMapping(streamerId: string, input: { resolvedRoomId: string | null; shortRoomId: string | null;
+  uid: string | null; expectedUid: string }): void {
+  const timestamp = now();
+  if (input.uid && input.uid !== input.expectedUid) {
+    getDb().prepare("UPDATE streamers SET room_mapping_status='conflict',room_mapping_checked_at=?,updated_at=? WHERE id=?")
+      .run(timestamp, timestamp, streamerId);
+    return;
+  }
+  if (!input.resolvedRoomId || !input.uid) {
+    getDb().prepare("UPDATE streamers SET room_mapping_status=CASE WHEN resolved_room_id IS NULL THEN 'unverified' ELSE room_mapping_status END,room_mapping_checked_at=?,updated_at=? WHERE id=?")
+      .run(timestamp, timestamp, streamerId);
+    return;
+  }
+  getDb().prepare(`UPDATE streamers SET resolved_room_id=?,room_short_id=?,room_mapping_status='verified',
+    room_mapping_checked_at=?,updated_at=? WHERE id=?`).run(input.resolvedRoomId, input.shortRoomId, timestamp, timestamp, streamerId);
+}
+
+export function createScheduleDraftCandidate(streamerId: string, dynamicId: string, contentHashValue: string, mediaUrls: string[]): string {
+  const existing = getDb().prepare('SELECT id FROM schedule_drafts WHERE dynamic_id=? AND content_hash=?')
+    .get(dynamicId, contentHashValue) as Row | undefined;
+  if (existing) return String(existing.id);
+  const id = randomUUID();
+  const timestamp = now();
+  const dynamic = getDb().prepare('SELECT text FROM dynamics WHERE id=?').get(dynamicId) as Row;
+  getDb().prepare(`INSERT INTO schedule_drafts(id,streamer_id,dynamic_id,content_hash,source_text,media_urls_json,created_at,updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(id, streamerId, dynamicId, contentHashValue, String(dynamic.text ?? ''),
+      JSON.stringify(mediaUrls.slice(0, 4)), timestamp, timestamp);
+  enqueueJob('recognize_schedule', id, {}, 40, timestamp, `recognize-schedule:${id}`);
+  return id;
+}
+
+export function createManualScheduleDraft(dynamicId: string): string {
+  const dynamic = getDb().prepare('SELECT id,streamer_id,content_hash FROM dynamics WHERE id=?').get(dynamicId) as Row | undefined;
+  if (!dynamic) throw new Error('动态不存在');
+  const urls = (getDb().prepare(`SELECT m.source_url FROM dynamic_media dm JOIN media_assets m ON m.id=dm.media_id
+    WHERE dm.dynamic_id=? ORDER BY dm.position LIMIT 4`).all(dynamicId) as Row[]).map((row) => String(row.source_url));
+  if (urls.length === 0) throw new Error('该动态没有可识别的正文图片');
+  return createScheduleDraftCandidate(String(dynamic.streamer_id), dynamicId, String(dynamic.content_hash), urls);
+}
+
+export function listScheduleDrafts(status?: string): ScheduleDraftRecord[] {
+  const rows = (status && status !== 'all'
+    ? getDb().prepare(`SELECT sd.*,s.name AS streamer_name,sd.source_text AS dynamic_text,d.published_at FROM schedule_drafts sd
+        JOIN streamers s ON s.id=sd.streamer_id JOIN dynamics d ON d.id=sd.dynamic_id WHERE sd.status=? ORDER BY sd.created_at DESC`).all(status)
+    : getDb().prepare(`SELECT sd.*,s.name AS streamer_name,sd.source_text AS dynamic_text,d.published_at FROM schedule_drafts sd
+        JOIN streamers s ON s.id=sd.streamer_id JOIN dynamics d ON d.id=sd.dynamic_id ORDER BY sd.created_at DESC`).all()) as Row[];
+  return rows.map(rowToScheduleDraft);
+}
+
+export function getScheduleDraft(id: string): ScheduleDraftRecord | null {
+  const row = getDb().prepare(`SELECT sd.*,s.name AS streamer_name,sd.source_text AS dynamic_text,d.published_at FROM schedule_drafts sd
+    JOIN streamers s ON s.id=sd.streamer_id JOIN dynamics d ON d.id=sd.dynamic_id WHERE sd.id=?`).get(id) as Row | undefined;
+  return row ? rowToScheduleDraft(row) : null;
+}
+
+export function saveScheduleDraftRecognition(id: string, input: { model: string; rawResult: unknown; entries: ScheduleDraftEntry[] }): boolean {
+  validateDraftEntries(input.entries);
+  const result = getDb().prepare(`UPDATE schedule_drafts SET status='review',model=?,raw_result_json=?,entries_json=?,error=NULL,updated_at=?
+    WHERE id=? AND status='processing'`).run(input.model, JSON.stringify(input.rawResult), JSON.stringify(input.entries), now(), id);
+  return result.changes > 0;
+}
+
+export function failScheduleDraftRecognition(id: string, error: unknown): boolean {
+  const result = getDb().prepare(`UPDATE schedule_drafts SET status='failed',error=?,updated_at=?
+    WHERE id=? AND status IN ('pending','processing')`).run(formatError(error), now(), id);
+  return result.changes > 0;
+}
+
+export function updateScheduleDraftEntries(id: string, entries: ScheduleDraftEntry[]): void {
+  validateDraftEntries(entries);
+  const draft = getDb().prepare('SELECT status FROM schedule_drafts WHERE id=?').get(id) as Row | undefined;
+  if (!draft) throw new Error('周表草稿不存在');
+  if (['confirmed', 'rejected'].includes(String(draft.status))) throw new Error('已完成审核的草稿不能再编辑');
+  getDb().prepare("UPDATE schedule_drafts SET status='review',entries_json=?,error=NULL,updated_at=? WHERE id=?")
+    .run(JSON.stringify(entries), now(), id);
+}
+
+export function rejectScheduleDraft(id: string, reviewer: string): void {
+  const draft = getDb().prepare('SELECT status FROM schedule_drafts WHERE id=?').get(id) as Row | undefined;
+  if (!draft) throw new Error('周表草稿不存在');
+  if (String(draft.status) === 'confirmed') throw new Error('已确认的周表不能拒绝');
+  getDb().prepare("UPDATE schedule_drafts SET status='rejected',reviewed_at=?,reviewed_by=?,updated_at=? WHERE id=?")
+    .run(now(), reviewer, now(), id);
+}
+
+export function requeueScheduleDraft(id: string): void {
+  const draft = getDb().prepare('SELECT status FROM schedule_drafts WHERE id=?').get(id) as Row | undefined;
+  if (!draft) throw new Error('周表草稿不存在');
+  if (['confirmed', 'rejected'].includes(String(draft.status))) throw new Error('已完成审核的草稿不能重新识别');
+  getDb().prepare("UPDATE schedule_drafts SET status='pending',error=NULL,updated_at=? WHERE id=?").run(now(), id);
+  enqueueJob('recognize_schedule', id, {}, 40, now(), `recognize-schedule:${id}:${Date.now()}`);
+}
+
+export function confirmScheduleDraft(id: string, monday: string | null, reviewer: string): number {
+  const draft = getScheduleDraft(id);
+  if (!draft) throw new Error('周表草稿不存在');
+  if (draft.status === 'confirmed') return number(draft.confirmedCount);
+  if (draft.status === 'rejected') throw new Error('已拒绝的周表不能确认');
+  const entries = draft.entries as ScheduleDraftEntry[];
+  validateDraftEntries(entries);
+  if (entries.length === 0) throw new Error('周表草稿没有可确认的条目');
+  const needsMonday = entries.some((entry) => !entry.occurrenceDate && entry.weekday != null);
+  if (needsMonday && (!monday || !isIsoDate(monday))) throw new Error('只有星期信息的周表必须填写有效的周一日期');
+  if (monday && new Date(`${monday}T00:00:00Z`).getUTCDay() !== 1) throw new Error('所选日期必须是周一');
+  const timestamp = now();
+  withTransaction((db) => {
+    for (const [index, entry] of entries.entries()) {
+      const occurrenceDate = entry.occurrenceDate ?? dateForWeekday(monday!, entry.weekday!);
+      const startAt = entry.status === 'cancelled' || !entry.localTime ? null : localScheduleIso(occurrenceDate, entry.localTime);
+      db.prepare(`INSERT INTO schedule_exceptions(id,streamer_id,occurrence_date,start_at,status,title,source,source_ref,
+        confidence,locked,created_at,updated_at) VALUES (?, ?, ?, ?, ?, ?, 'schedule_confirmed', ?, ?, 1, ?, ?)
+        ON CONFLICT(streamer_id,occurrence_date,source_ref) DO UPDATE SET start_at=excluded.start_at,status=excluded.status,
+        title=excluded.title,confidence=excluded.confidence,locked=1,updated_at=excluded.updated_at,version=schedule_exceptions.version+1`)
+        .run(randomUUID(), String(draft.streamerId), occurrenceDate, startAt, entry.status, entry.title || null,
+          `schedule-draft:${id}:${index}`, Math.round(entry.confidence), timestamp, timestamp);
+      upsertTimelineEventInTransaction(db, { streamerId: String(draft.streamerId),
+        eventType: entry.status === 'cancelled' ? 'cancelled' : entry.status === 'delayed' ? 'delayed' : 'scheduled',
+        plannedStartAt: startAt, sourceType: 'schedule_draft', sourceId: `${id}:${index}`, title: entry.title,
+        confidence: entry.confidence });
+    }
+    db.prepare("UPDATE schedule_drafts SET status='confirmed',reviewed_at=?,reviewed_by=?,updated_at=? WHERE id=?")
+      .run(timestamp, reviewer, timestamp, id);
+  });
+  refreshForecastFromSchedules(String(draft.streamerId));
+  enqueueJob('pi_analyze', String(draft.streamerId), { scheduleDraftId: id }, 10, timestamp, `pi-schedule-confirmed:${id}`);
+  return entries.length;
+}
+
+export function upsertTimelineEvent(input: { streamerId: string; eventType: string; plannedStartAt?: string | null;
+  occurredAt?: string | null; sourceType: string; sourceId: string; title?: string; confidence: number }): string {
+  const id = withTransaction((db) => upsertTimelineEventInTransaction(db, input));
+  if (input.eventType === 'cancelled') {
+    getDb().prepare("UPDATE forecasts SET stale=1 WHERE streamer_id=? AND active=1 AND source!='manual'").run(input.streamerId);
+  } else if (input.plannedStartAt && ['scheduled', 'delayed', 'additional'].includes(input.eventType)) {
+    try {
+      setForecast({ streamerId: input.streamerId, predictedStartAt: input.plannedStartAt, confidence: input.confidence,
+        source: input.sourceType === 'schedule_draft' ? 'schedule_confirmed' : 'dynamic',
+        reason: input.title || '根据明确时间事件更新', evidence: [{ type: 'timeline_event', id }], uncertaintyMinutes: 0 }, 'timeline');
+    } catch (error) {
+      if (!(error instanceof Error && /更高优先级|人工预测/.test(error.message))) throw error;
+    }
+  }
+  return id;
+}
+
+export function listTimelineEvents(streamerId: string, limit = 50): Row[] {
+  return getDb().prepare(`SELECT * FROM timeline_events WHERE streamer_id=? AND active=1
+    ORDER BY COALESCE(planned_start_at,occurred_at,created_at) DESC LIMIT ?`).all(streamerId, clamp(limit, 1, 200)) as Row[];
+}
+
+export function getPredictionEvaluationSummary(streamerId: string): PredictionEvaluationSummary {
+  const recent = getDb().prepare(`SELECT * FROM prediction_evaluations WHERE streamer_id=? AND outcome='evaluated'
+    ORDER BY created_at DESC LIMIT 30`).all(streamerId) as Row[];
+  const bySource: Record<string, { count: number; mae: number; within30: number; within60: number }> = {};
+  for (const row of recent) {
+    const source = String(row.source ?? 'unknown');
+    const bucket = bySource[source] ??= { count: 0, mae: 0, within30: 0, within60: 0 };
+    bucket.count += 1; bucket.mae += Math.abs(number(row.error_minutes));
+    bucket.within30 += number(row.within_30); bucket.within60 += number(row.within_60);
+  }
+  for (const value of Object.values(bySource)) value.mae = Math.round(value.mae / value.count * 10) / 10;
+  const count = recent.length;
+  return { count, ready: count >= 3,
+    mae: count ? Math.round(recent.reduce((sum, row) => sum + Math.abs(number(row.error_minutes)), 0) / count * 10) / 10 : null,
+    within30: count ? Math.round(recent.reduce((sum, row) => sum + number(row.within_30), 0) / count * 100) : null,
+    within60: count ? Math.round(recent.reduce((sum, row) => sum + number(row.within_60), 0) / count * 100) : null,
+    bySource };
+}
+
 export function replaceManualScheduleRules(streamerId: string, rules: Array<{ weekday: number; localTime: string; title?: string }>,
   actor = 'admin-ui'): void {
   for (const rule of rules) {
@@ -678,6 +979,7 @@ export function replaceManualScheduleRules(streamerId: string, rules: Array<{ we
   withTransaction((db) => {
     const before = db.prepare("SELECT * FROM schedule_rules WHERE streamer_id=? AND source='manual' AND active=1").all(streamerId);
     db.prepare("UPDATE schedule_rules SET active=0,updated_at=? WHERE streamer_id=? AND source='manual'").run(now(), streamerId);
+    db.prepare("UPDATE forecasts SET stale=1 WHERE streamer_id=? AND active=1 AND source='weekly_schedule'").run(streamerId);
     for (const rule of rules) {
       db.prepare(`INSERT INTO schedule_rules(id,streamer_id,weekday,local_time,title,source,confidence,locked,created_at,updated_at)
         VALUES (?, ?, ?, ?, ?, 'manual', 100, 1, ?, ?)`)
@@ -685,6 +987,29 @@ export function replaceManualScheduleRules(streamerId: string, rules: Array<{ we
     }
     insertAudit(db, actor, null, 'schedule.manual.replace', 'streamer', streamerId, before, rules);
   });
+  refreshForecastFromSchedules(streamerId);
+}
+
+export function refreshForecastFromSchedules(streamerId: string): string | null {
+  const live = getDb().prepare('SELECT status FROM live_state WHERE streamer_id=?').get(streamerId) as Row | undefined;
+  if (live?.status === 'live') return null;
+  const manual = getDb().prepare("SELECT id FROM forecasts WHERE streamer_id=? AND active=1 AND source='manual'").get(streamerId);
+  if (manual) return null;
+  const today = shanghaiDate(new Date());
+  const exception = getDb().prepare(`SELECT * FROM schedule_exceptions WHERE streamer_id=? AND occurrence_date>=?
+    AND status IN ('scheduled','delayed') AND start_at>? ORDER BY start_at LIMIT 1`).get(streamerId, today, now()) as Row | undefined;
+  if (exception?.start_at) {
+    return setScheduleForecastSafely({ streamerId, predictedStartAt: String(exception.start_at), confidence: number(exception.confidence),
+      source: 'schedule_confirmed', reason: String(exception.title ?? '已确认单周安排'),
+      evidence: [{ type: 'schedule_exception', id: String(exception.id) }], uncertaintyMinutes: 0 });
+  }
+  const rules = getDb().prepare(`SELECT * FROM schedule_rules WHERE streamer_id=? AND active=1 ORDER BY weekday,local_time`).all(streamerId) as Row[];
+  const next = rules.map((rule) => ({ rule, at: nextRuleOccurrence(number(rule.weekday), String(rule.local_time)) }))
+    .filter(({ at }) => at.getTime() > Date.now()).sort((a, b) => a.at.getTime() - b.at.getTime())[0];
+  if (!next) return null;
+  return setScheduleForecastSafely({ streamerId, predictedStartAt: next.at.toISOString(), confidence: number(next.rule.confidence),
+    source: 'weekly_schedule', reason: String(next.rule.title ?? '固定周表'),
+    evidence: [{ type: 'schedule_rule', id: String(next.rule.id) }], uncertaintyMinutes: 0 });
 }
 
 export function upsertScheduleException(streamerId: string, exception: { occurrenceDate: string; startAt?: string | null;
@@ -729,10 +1054,10 @@ export function getDashboardStats(): Record<string, number> {
 function listMediaFor(kind: 'dynamic' | 'comment', id: string): MediaAsset[] {
   const link = kind === 'dynamic' ? 'dynamic_media' : 'comment_media';
   const column = kind === 'dynamic' ? 'dynamic_id' : 'comment_id';
-  const rows = getDb().prepare(`SELECT m.* FROM media_assets m JOIN ${link} l ON l.media_id=m.id
+  const rows = getDb().prepare(`SELECT m.*,COALESCE(l.source_url,m.source_url) AS requested_source_url FROM media_assets m JOIN ${link} l ON l.media_id=m.id
                                 WHERE l.${column}=? ORDER BY l.position`).all(id) as Row[];
   return rows.map((row) => ({
-    id: String(row.id), sha256: text(row.sha256), sourceUrl: String(row.source_url),
+    id: String(row.id), sha256: text(row.sha256), sourceUrl: String(row.requested_source_url),
     localUrl: row.local_path ? `/media/${String(row.id)}` : null, mimeType: text(row.mime_type),
     byteSize: row.byte_size == null ? null : number(row.byte_size), state: String(row.state) as MediaAsset['state']
   }));
@@ -740,10 +1065,14 @@ function listMediaFor(kind: 'dynamic' | 'comment', id: string): MediaAsset[] {
 
 function listMediaByUrls(urls: string[]): MediaAsset[] {
   if (urls.length === 0) return [];
-  const rows = getDb().prepare(`SELECT * FROM media_assets WHERE source_url IN (${urls.map(() => '?').join(',')})`).all(...urls) as Row[];
-  const byUrl = new Map(rows.map((row) => [String(row.source_url), row]));
-  return urls.map((url) => byUrl.get(url)).filter((row): row is Row => Boolean(row)).map((row) => ({
-    id: String(row.id), sha256: text(row.sha256), sourceUrl: String(row.source_url), localUrl: row.local_path ? `/media/${String(row.id)}` : null,
+  const placeholders = urls.map(() => '?').join(',');
+  const rows = getDb().prepare(`SELECT m.*,q.requested_url FROM (
+      SELECT source_url AS requested_url,id AS media_id FROM media_assets
+      UNION ALL SELECT source_url AS requested_url,media_id FROM media_source_aliases
+    ) q JOIN media_assets m ON m.id=q.media_id WHERE q.requested_url IN (${placeholders})`).all(...urls) as Row[];
+  const byUrl = new Map(rows.map((row) => [String(row.requested_url), row]));
+  return urls.map((url) => ({ url, row: byUrl.get(url) })).filter((item): item is { url: string; row: Row } => Boolean(item.row)).map(({ url, row }) => ({
+    id: String(row.id), sha256: text(row.sha256), sourceUrl: url, localUrl: row.local_path ? `/media/${String(row.id)}` : null,
     mimeType: text(row.mime_type), byteSize: row.byte_size == null ? null : number(row.byte_size), state: String(row.state) as MediaAsset['state']
   }));
 }
@@ -772,7 +1101,8 @@ function linkMediaUrls(db: ReturnType<typeof getDb>, kind: 'dynamic' | 'comment'
   const column = kind === 'dynamic' ? 'dynamic_id' : 'comment_id';
   urls.forEach((rawSourceUrl, position) => {
     const sourceUrl = normalizeMediaUrl(rawSourceUrl);
-    let media = db.prepare('SELECT id FROM media_assets WHERE source_url=? ORDER BY created_at LIMIT 1').get(sourceUrl) as Row | undefined;
+    let media = db.prepare(`SELECT id FROM media_assets WHERE source_url=? UNION ALL
+      SELECT media_id AS id FROM media_source_aliases WHERE source_url=? LIMIT 1`).get(sourceUrl, sourceUrl) as Row | undefined;
     if (!media) {
       media = { id: randomUUID() };
       const mediaId = String(media.id);
@@ -781,9 +1111,9 @@ function linkMediaUrls(db: ReturnType<typeof getDb>, kind: 'dynamic' | 'comment'
         enqueueJob('download_media', mediaId, {}, 20, now(), `media:${contentHash(sourceUrl)}`);
     }
     const mediaId = String(media.id);
-    db.prepare(`INSERT INTO ${link}(${column},media_id,position) VALUES (?, ?, ?)
-                ON CONFLICT(${column},media_id) DO UPDATE SET position=excluded.position`)
-      .run(ownerId, mediaId, position);
+    db.prepare(`INSERT INTO ${link}(${column},media_id,position,source_url) VALUES (?, ?, ?, ?)
+                ON CONFLICT(${column},media_id) DO UPDATE SET position=excluded.position,source_url=excluded.source_url`)
+      .run(ownerId, mediaId, position, sourceUrl);
   });
 }
 
@@ -793,12 +1123,20 @@ function normalizeMediaUrl(url: string): string {
 }
 
 function rowToSummary(row: Row): StreamerSummary {
+  const liveStatus = String(row.live_status) as LiveStatus;
+  const confidence = row.confidence == null ? null : number(row.confidence);
+  const stale = bool(row.forecast_stale);
+  const forecastStatus = liveStatus === 'live' ? 'live' : bool(row.cancelled_today) ? 'cancelled_today'
+    : stale ? 'stale' : confidence == null || confidence < 40 ? 'insufficient' : confidence >= 70 ? 'exact' : 'range';
   return {
     id: String(row.id), slug: String(row.slug), name: String(row.name), biliUid: String(row.bili_uid),
-    roomId: String(row.room_id), avatarUrl: text(row.avatar_url), liveStatus: String(row.live_status) as LiveStatus,
+    roomId: String(row.room_id), resolvedRoomId: text(row.resolved_room_id), roomShortId: text(row.room_short_id),
+    roomMappingStatus: String(row.room_mapping_status ?? 'unverified') as StreamerSummary['roomMappingStatus'],
+    avatarUrl: text(row.avatar_url), liveStatus,
     liveTitle: text(row.live_title), predictedStartAt: text(row.predicted_start_at),
-    confidence: row.confidence == null ? null : number(row.confidence), forecastSource: row.forecast_source as StreamerSummary['forecastSource'] ?? null,
-    forecastReason: text(row.forecast_reason), forecastStale: bool(row.forecast_stale), lastCheckedAt: text(row.checked_at)
+    confidence, forecastSource: row.forecast_source as StreamerSummary['forecastSource'] ?? null,
+    forecastReason: forecastStatus === 'cancelled_today' ? '已确认今天取消直播。' : text(row.forecast_reason), forecastStale: stale, forecastStatus,
+    uncertaintyMinutes: row.uncertainty_minutes == null ? null : number(row.uncertainty_minutes), lastCheckedAt: text(row.checked_at)
   };
 }
 
@@ -833,6 +1171,146 @@ function normalizeSlug(value: string): string {
 
 function containsTimeSignal(message: string): boolean {
   return /(周表|开播|直播|今晚|明晚|今天|明天|后天|迟到|晚点|推迟|延后|请假|休息|加播|\d{1,2}\s*[:：点时]\s*\d{0,2})/i.test(message);
+}
+
+function isScheduleCandidate(message: string, mediaUrls: string[]): boolean {
+  return mediaUrls.length > 0 && /(周表|日程|本周|直播安排|直播日历|直播计划)/i.test(message);
+}
+
+export function encodeArchiveCursor(cursor: ArchiveCursor): string {
+  return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
+}
+
+export function decodeArchiveCursor(value: string | null | undefined): ArchiveCursor | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as ArchiveCursor;
+    if (!parsed || typeof parsed.id !== 'string' || !parsed.id || typeof parsed.publishedAt !== 'string' ||
+      Number.isNaN(new Date(parsed.publishedAt).getTime())) return null;
+    return parsed;
+  } catch { return null; }
+}
+
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (character) => `\\${character}`);
+}
+
+function rowToScheduleDraft(row: Row): ScheduleDraftRecord {
+  return {
+    id: String(row.id), streamerId: String(row.streamer_id), streamerName: String(row.streamer_name ?? ''),
+    dynamicId: String(row.dynamic_id), dynamicText: String(row.dynamic_text ?? ''), publishedAt: String(row.published_at ?? ''),
+    contentHash: String(row.content_hash), mediaUrls: safeJson<string[]>(String(row.media_urls_json ?? '[]'), []),
+    status: String(row.status), model: text(row.model), rawResult: safeJson(String(row.raw_result_json ?? 'null'), null),
+    entries: safeJson<ScheduleDraftEntry[]>(String(row.entries_json ?? '[]'), []), error: text(row.error), reviewedAt: text(row.reviewed_at),
+    reviewedBy: text(row.reviewed_by), createdAt: String(row.created_at), updatedAt: String(row.updated_at),
+    confirmedCount: String(row.status) === 'confirmed' ? (safeJson(String(row.entries_json ?? '[]'), []) as unknown[]).length : 0
+  };
+}
+
+function validateDraftEntries(entries: ScheduleDraftEntry[]): void {
+  if (!Array.isArray(entries) || entries.length > 30) throw new Error('周表条目必须是最多 30 项的数组');
+  for (const entry of entries) {
+    if (entry.occurrenceDate && !isIsoDate(entry.occurrenceDate)) throw new Error('周表日期必须是有效的 YYYY-MM-DD 日期');
+    if (entry.weekday != null && (!Number.isInteger(entry.weekday) || entry.weekday < 1 || entry.weekday > 7)) throw new Error('weekday 必须在 1 到 7 之间');
+    if (!entry.occurrenceDate && entry.weekday == null) throw new Error('周表条目必须包含日期或星期');
+    if (entry.status !== 'cancelled' && (!entry.localTime || !/^([01]\d|2[0-3]):[0-5]\d$/.test(entry.localTime))) {
+      throw new Error('非取消条目必须包含 HH:mm 时间');
+    }
+    if (!['scheduled', 'delayed', 'cancelled'].includes(entry.status)) throw new Error('周表状态无效');
+    if (!Number.isFinite(entry.confidence) || entry.confidence < 0 || entry.confidence > 100) throw new Error('周表置信度必须在 0 到 100 之间');
+  }
+}
+
+function dateForWeekday(monday: string, weekday: number): string {
+  const date = new Date(`${monday}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + weekday - 1);
+  return date.toISOString().slice(0, 10);
+}
+
+function isIsoDate(value: string): boolean {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return false;
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  return date.getUTCFullYear() === Number(match[1]) && date.getUTCMonth() === Number(match[2]) - 1 && date.getUTCDate() === Number(match[3]);
+}
+
+function localScheduleIso(date: string, time: string): string {
+  return new Date(`${date}T${time}:00+08:00`).toISOString();
+}
+
+function upsertTimelineEventInTransaction(db: ReturnType<typeof getDb>, input: { streamerId: string; eventType: string;
+  plannedStartAt?: string | null; occurredAt?: string | null; sourceType: string; sourceId: string; title?: string;
+  confidence: number }): string {
+  if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 100) throw new Error('事件置信度必须在 0 到 100 之间');
+  if (input.plannedStartAt && Number.isNaN(new Date(input.plannedStartAt).getTime())) throw new Error('计划时间格式无效');
+  if (input.occurredAt && Number.isNaN(new Date(input.occurredAt).getTime())) throw new Error('发生时间格式无效');
+  const eventKey = `${input.streamerId}:${input.sourceType}:${input.sourceId}:${input.eventType}`;
+  const existing = db.prepare('SELECT id FROM timeline_events WHERE event_key=?').get(eventKey) as Row | undefined;
+  const id = existing ? String(existing.id) : randomUUID();
+  const timestamp = now();
+  db.prepare(`INSERT INTO timeline_events(id,streamer_id,event_type,planned_start_at,occurred_at,source_type,source_id,title,
+    confidence,event_key,created_at,updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(event_key) DO UPDATE SET planned_start_at=excluded.planned_start_at,occurred_at=excluded.occurred_at,
+      title=excluded.title,confidence=excluded.confidence,active=1,updated_at=excluded.updated_at`)
+    .run(id, input.streamerId, input.eventType, input.plannedStartAt ?? null, input.occurredAt ?? null, input.sourceType,
+      input.sourceId, input.title ?? null, Math.round(input.confidence), eventKey, timestamp, timestamp);
+  return id;
+}
+
+function evaluateLiveStartInTransaction(db: ReturnType<typeof getDb>, streamerId: string, sessionId: string, actualStartAt: string): void {
+  const cutoff = new Date(new Date(actualStartAt).getTime() - 10 * 60_000).toISOString();
+  const windowStart = new Date(new Date(actualStartAt).getTime() - 6 * 3600_000).toISOString();
+  const windowEnd = new Date(new Date(actualStartAt).getTime() + 6 * 3600_000).toISOString();
+  const forecast = db.prepare(`SELECT * FROM forecasts WHERE streamer_id=? AND created_at<=?
+    AND predicted_start_at BETWEEN ? AND ? ORDER BY created_at DESC LIMIT 1`).get(streamerId, cutoff, windowStart, windowEnd) as Row | undefined;
+  if (!forecast) {
+    db.prepare(`INSERT OR IGNORE INTO prediction_evaluations(id,streamer_id,live_session_id,outcome,actual_start_at,created_at)
+      VALUES (?, ?, ?, 'missed', ?, ?)`).run(randomUUID(), streamerId, sessionId, actualStartAt, now());
+    return;
+  }
+  const errorMinutes = (new Date(actualStartAt).getTime() - new Date(String(forecast.predicted_start_at)).getTime()) / 60_000;
+  const leadMinutes = (new Date(actualStartAt).getTime() - new Date(String(forecast.created_at)).getTime()) / 60_000;
+  db.prepare(`INSERT OR IGNORE INTO prediction_evaluations(id,streamer_id,forecast_id,live_session_id,outcome,predicted_start_at,
+    actual_start_at,error_minutes,lead_minutes,source,within_30,within_60,created_at) VALUES (?, ?, ?, ?, 'evaluated', ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(randomUUID(), streamerId, String(forecast.id), sessionId, String(forecast.predicted_start_at), actualStartAt,
+      errorMinutes, leadMinutes, String(forecast.source), Math.abs(errorMinutes) <= 30 ? 1 : 0, Math.abs(errorMinutes) <= 60 ? 1 : 0, now());
+}
+
+function recordNoShowEvaluation(forecastId: string): void {
+  const forecast = getDb().prepare('SELECT * FROM forecasts WHERE id=?').get(forecastId) as Row | undefined;
+  if (!forecast) return;
+  getDb().prepare(`INSERT OR IGNORE INTO prediction_evaluations(id,streamer_id,forecast_id,outcome,predicted_start_at,source,created_at)
+    VALUES (?, ?, ?, 'no_show', ?, ?, ?)`).run(randomUUID(), String(forecast.streamer_id), forecastId,
+      String(forecast.predicted_start_at), String(forecast.source), now());
+}
+
+function forecastPriority(source: string): number {
+  return source === 'manual' ? 100 : source === 'dynamic' ? 80 : source === 'schedule_confirmed' ? 70
+    : source === 'weekly_schedule' ? 60 : source === 'pi' ? 50 : 0;
+}
+
+function setScheduleForecastSafely(input: Parameters<typeof setForecast>[0]): string | null {
+  try { return setForecast(input, 'schedule'); }
+  catch (error) {
+    if (error instanceof Error && /更高优先级|人工预测/.test(error.message)) return null;
+    throw error;
+  }
+}
+
+function shanghaiDate(value: Date): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(value);
+}
+
+function nextRuleOccurrence(weekday: number, localTime: string): Date {
+  const nowDate = new Date();
+  const shanghaiNow = new Date(nowDate.toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
+  const currentWeekday = shanghaiNow.getDay() || 7;
+  let days = (weekday - currentWeekday + 7) % 7;
+  const [hour, minute] = localTime.split(':').map(Number);
+  if (days === 0 && (hour < shanghaiNow.getHours() || (hour === shanghaiNow.getHours() && minute <= shanghaiNow.getMinutes()))) days = 7;
+  shanghaiNow.setDate(shanghaiNow.getDate() + days);
+  const date = `${shanghaiNow.getFullYear()}-${String(shanghaiNow.getMonth() + 1).padStart(2, '0')}-${String(shanghaiNow.getDate()).padStart(2, '0')}`;
+  return new Date(`${date}T${localTime}:00+08:00`);
 }
 
 function clamp(value: number, min: number, max: number): number {

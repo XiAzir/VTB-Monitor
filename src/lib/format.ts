@@ -25,7 +25,8 @@ export function confidenceClass(value: number | null): 'high' | 'medium' | 'low'
 }
 
 export function sourceLabel(source: string | null): string {
-  return ({ manual: '人工', dynamic: '明确动态', weekly_schedule: '周表', pi: 'Pi 推测', fallback: '系统顺延' } as Record<string, string>)[source ?? ''] ?? '待分析';
+  return ({ manual: '人工', dynamic: '明确动态', schedule_confirmed: '已确认周表', weekly_schedule: '固定周表',
+    pi: 'Pi 推测', fallback: '系统顺延' } as Record<string, string>)[source ?? ''] ?? '待分析';
 }
 
 export function richTextHtml(text: string, emojiMap: Record<string, string> = {}): string {

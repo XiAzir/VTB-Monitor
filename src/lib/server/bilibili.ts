@@ -24,6 +24,8 @@ export interface LiveStateResult {
   status: LiveStatus;
   title: string | null;
   uid: string | null;
+  resolvedRoomId: string | null;
+  shortRoomId: string | null;
 }
 
 export class BilibiliError extends Error {
@@ -191,14 +193,19 @@ export class BilibiliClient {
     for (const target of normalizedTargets) {
       // UID results are preferred because room_id and short_id are aliases, not identities.
       const uidRoom = target.biliUid ? resolveUidRecord(roomsByUid, target.biliUid) : undefined;
+      const aliasRoom = resolveRoomRecord(roomsByRoomId, target.roomId);
       const room = (uidRoom && matchesRoomAlias('', uidRoom, target.roomId) ? uidRoom : undefined)
         ?? resolveRoomRecord(roomsByRoomId, target.roomId, target.biliUid || undefined);
       if (!room) {
-        result.set(target.key, { status: 'unknown', title: null, uid: null });
+        const conflictUid = aliasRoom?.uid && target.biliUid && normalizeNumericId(aliasRoom.uid) !== target.biliUid
+          ? String(aliasRoom.uid) : null;
+        result.set(target.key, { status: 'unknown', title: null, uid: conflictUid, resolvedRoomId: null, shortRoomId: null });
         continue;
       }
       const status: LiveStatus = Number(room.live_status) === 1 ? 'live' : Number(room.live_status) === 2 ? 'rotating' : 'offline';
-      result.set(target.key, { status, title: room.title ? String(room.title) : null, uid: room.uid ? String(room.uid) : null });
+      result.set(target.key, { status, title: room.title ? String(room.title) : null, uid: room.uid ? String(room.uid) : null,
+        resolvedRoomId: room.room_id ? String(room.room_id) : null,
+        shortRoomId: Number(room.short_id ?? 0) > 0 ? String(room.short_id) : null });
     }
     return result;
   }

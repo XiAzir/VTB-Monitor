@@ -1,11 +1,16 @@
+import { readFileSync } from 'node:fs';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { BilibiliClient, extractInitialState, normalizeComment, normalizeDynamic, resolveRoomRecord } from './bilibili';
 import { closeDb, getDb } from './db';
 import { decryptSecret, encryptSecret, hashPassword, verifyPassword } from './security';
 import { richTextHtml } from '$lib/format';
+import { recognizeScheduleDraftWithPi } from './pi';
+import { downloadMediaAsset } from './media';
 import {
-  createStreamer, enqueueJob, getSecret, leaseNextJob, listComments, listDynamics, markMissingRootCommentsUnavailable, putSecret,
-  setForecast, upsertComment, upsertDynamic
+  confirmScheduleDraft, createManualScheduleDraft, createStreamer, decodeArchiveCursor, enqueueJob, getPredictionEvaluationSummary,
+  failScheduleDraftRecognition, getScheduleDraft, getSecret, leaseNextJob, listComments, listCommentsPage, listDynamicRevisions, listDynamics, listDynamicsPage,
+  markMissingDynamicsDeleted, markMissingRootCommentsUnavailable, putSecret, rollOverdueForecasts, setForecast, updateLiveState,
+  saveScheduleDraftRecognition, updateRoomMapping, updateScheduleDraftEntries, upsertComment, upsertDynamic, upsertTimelineEvent
 } from './store';
 
 afterAll(() => closeDb());
@@ -36,6 +41,15 @@ describe('Bilibili normalization', () => {
     expect(dynamic.mediaUrls).toEqual(['https://i1.hdslb.com/image.png']);
     expect(richTextHtml('[测试]', { '[测试]': 'https://i0.hdslb.com/emoji.png' }))
       .toContain('src="/api/image-proxy/i0.hdslb.com/emoji.png"');
+  });
+
+  it('parses sanitized fixtures for common dynamic types', () => {
+    const fixtures = JSON.parse(readFileSync(new URL('../../../tests/fixtures/bilibili/dynamic-types.json', import.meta.url), 'utf8')) as Record<string, any>;
+    expect(normalizeDynamic(fixtures.word, '42')).toMatchObject({ id: 'fixture-word', text: '今晚 20:00 开播' });
+    expect(normalizeDynamic(fixtures.draw, '42').mediaUrls).toEqual(['https://i0.hdslb.com/bfs/new_dyn/schedule.png']);
+    expect(normalizeDynamic(fixtures.video, '42').mediaUrls).toEqual(['https://i1.hdslb.com/bfs/archive/cover.jpg']);
+    expect(normalizeDynamic(fixtures.forward, '42')).toMatchObject({ type: 'DYNAMIC_TYPE_FORWARD', text: '转发一下' });
+    expect(normalizeDynamic(fixtures.poll, '42')).toMatchObject({ type: 'DYNAMIC_TYPE_COMMON_SQUARE', text: '投票动态' });
   });
 
   it('marks a dynamic feed complete only after passing the cutoff', async () => {
@@ -79,7 +93,8 @@ describe('Bilibili normalization', () => {
         { roomId: '510', biliUid: '7706705' },
         { roomId: '999', biliUid: '7706705' }
       ]);
-      expect(states.get('510')).toMatchObject({ status: 'live', title: '看比赛咯', uid: '7706705' });
+      expect(states.get('510')).toMatchObject({ status: 'live', title: '看比赛咯', uid: '7706705',
+        resolvedRoomId: '80397', shortRoomId: '510' });
       expect(states.get('999')).toMatchObject({ status: 'unknown' });
       const request = new URL(String(fetchMock.mock.calls[0]?.[0]));
       expect(request.searchParams.getAll('room_ids')).toEqual(['510', '999']);
@@ -146,5 +161,151 @@ describe('security and persistence', () => {
       source: 'manual', reason: '人工', evidence: [] }, 'test');
     expect(() => setForecast({ streamerId, predictedStartAt: new Date(Date.now() + 7200_000).toISOString(), confidence: 80,
       source: 'pi', reason: 'AI', evidence: [] }, 'pi')).toThrow('人工预测已锁定');
+  });
+
+  it('confirms deletion only after two independent complete scans and restores visibility', () => {
+    const streamerId = createStreamer({ slug: 'delete-test', name: '判删测试', biliUid: '10002', roomId: '20002' });
+    const publishedAt = new Date().toISOString();
+    upsertDynamic({ id: 'delete-dyn', streamerId, type: 'word', text: '仍然存在', sourceUrl: 'https://example.invalid/delete', publishedAt });
+    markMissingDynamicsDeleted(streamerId, [], new Date(Date.now() - 3600_000).toISOString(), 'scan-one');
+    expect(listDynamics(streamerId)[0].state).toBe('suspected_deleted');
+    markMissingDynamicsDeleted(streamerId, [], new Date(Date.now() - 3600_000).toISOString(), 'scan-one');
+    expect(listDynamics(streamerId)[0].state).toBe('suspected_deleted');
+    markMissingDynamicsDeleted(streamerId, [], new Date(Date.now() - 3600_000).toISOString(), 'scan-two');
+    expect(listDynamics(streamerId)[0].state).toBe('deleted');
+    upsertDynamic({ id: 'delete-dyn', streamerId, type: 'word', text: '重新出现', sourceUrl: 'https://example.invalid/delete', publishedAt });
+    expect(listDynamics(streamerId)[0].state).toBe('visible');
+  });
+
+  it('paginates equal timestamps with compound cursors and applies archive filters', () => {
+    const streamerId = createStreamer({ slug: 'paging-test', name: '分页测试', biliUid: '10003', roomId: '20003' });
+    const publishedAt = '2026-08-01T12:00:00.000Z';
+    for (const id of ['page-c', 'page-b', 'page-a']) upsertDynamic({ id, streamerId, type: id === 'page-b' ? 'image' : 'word',
+      text: id === 'page-a' ? '目标正文' : id, sourceUrl: `https://example.invalid/${id}`, publishedAt,
+      mediaUrls: id === 'page-b' ? ['https://example.invalid/paging.png'] : [] });
+    const first = listDynamicsPage(streamerId, 2);
+    expect(first.items.map((item) => item.id)).toEqual(['page-c', 'page-b']);
+    expect(decodeArchiveCursor(first.nextCursor)?.id).toBe('page-b');
+    expect(listDynamicsPage(streamerId, 2, first.nextCursor ?? undefined).items.map((item) => item.id)).toEqual(['page-a']);
+    expect(listDynamicsPage(streamerId, 30, undefined, { q: '目标', type: 'word' }).items.map((item) => item.id)).toEqual(['page-a']);
+    expect(listDynamicsPage(streamerId, 30, undefined, { hasMedia: true }).items.map((item) => item.id)).toEqual(['page-b']);
+
+    for (const id of ['comment-c', 'comment-b', 'comment-a']) upsertComment({ id, dynamicId: 'page-a', authorUid: id,
+      authorName: id, message: id, publishedAt });
+    const comments = listCommentsPage('page-a', 2);
+    expect(comments.items.map((item) => item.id)).toEqual(['comment-c', 'comment-b']);
+    expect(listCommentsPage('page-a', 2, comments.nextCursor ?? undefined).items.map((item) => item.id)).toEqual(['comment-a']);
+  });
+
+  it('persists room mappings and rejects UID conflicts', () => {
+    const streamerId = createStreamer({ slug: 'room-test', name: '房间测试', biliUid: '7706705', roomId: '510' });
+    updateRoomMapping(streamerId, { resolvedRoomId: '80397', shortRoomId: '510', uid: '7706705', expectedUid: '7706705' });
+    expect(getDb().prepare('SELECT resolved_room_id,room_mapping_status FROM streamers WHERE id=?').get(streamerId))
+      .toMatchObject({ resolved_room_id: '80397', room_mapping_status: 'verified' });
+    updateRoomMapping(streamerId, { resolvedRoomId: '90001', shortRoomId: '510', uid: '9000001', expectedUid: '7706705' });
+    expect(getDb().prepare('SELECT resolved_room_id,room_mapping_status FROM streamers WHERE id=?').get(streamerId))
+      .toMatchObject({ resolved_room_id: '80397', room_mapping_status: 'conflict' });
+  });
+
+  it('creates, edits, and idempotently confirms schedule drafts', () => {
+    const streamerId = createStreamer({ slug: 'schedule-test', name: '周表测试', biliUid: '10004', roomId: '20004' });
+    upsertDynamic({ id: 'schedule-dyn', streamerId, type: 'draw', text: '本周直播周表', sourceUrl: 'https://example.invalid/schedule',
+      publishedAt: new Date().toISOString(), mediaUrls: ['https://example.invalid/schedule.png'] });
+    const draftId = createManualScheduleDraft('schedule-dyn');
+    updateScheduleDraftEntries(draftId, [{ occurrenceDate: null, weekday: 3, localTime: '20:00', status: 'scheduled',
+      title: '游戏', confidence: 91, sourceText: '周三 20:00 游戏' }]);
+    expect(() => confirmScheduleDraft(draftId, null, 'test')).toThrow('周一日期');
+    expect(confirmScheduleDraft(draftId, '2026-08-24', 'test')).toBe(1);
+    expect(confirmScheduleDraft(draftId, '2026-08-24', 'test')).toBe(1);
+    expect(getScheduleDraft(draftId)?.status).toBe('confirmed');
+    expect(getDb().prepare("SELECT COUNT(*) count FROM schedule_exceptions WHERE source='schedule_confirmed'").get())
+      .toMatchObject({ count: 1 });
+  });
+
+  it('does not let a queued recognizer overwrite an edited schedule draft', async () => {
+    const streamerId = createStreamer({ slug: 'schedule-race', name: '周表竞态', biliUid: '10006', roomId: '20006' });
+    upsertDynamic({ id: 'schedule-race-dyn', streamerId, type: 'draw', text: '直播安排',
+      sourceUrl: 'https://example.invalid/schedule-race', publishedAt: new Date().toISOString(),
+      mediaUrls: ['https://example.invalid/schedule-race.png'] });
+    const draftId = createManualScheduleDraft('schedule-race-dyn');
+    updateScheduleDraftEntries(draftId, [{ occurrenceDate: '2026-08-31', weekday: null, localTime: '19:00', status: 'scheduled',
+      title: '人工草稿', confidence: 100, sourceText: '8月31日 19:00' }]);
+    await recognizeScheduleDraftWithPi(draftId);
+    expect(getScheduleDraft(draftId)).toMatchObject({ status: 'review', entries: [{ title: '人工草稿' }] });
+  });
+
+  it('does not let an in-flight recognizer overwrite an edited schedule draft', () => {
+    const streamerId = createStreamer({ slug: 'schedule-inflight', name: '周表运行竞态', biliUid: '10009', roomId: '20009' });
+    upsertDynamic({ id: 'schedule-inflight-dyn', streamerId, type: 'draw', text: '本周直播安排',
+      sourceUrl: 'https://example.invalid/schedule-inflight', publishedAt: new Date().toISOString(),
+      mediaUrls: ['https://example.invalid/schedule-inflight.png'] });
+    const draftId = createManualScheduleDraft('schedule-inflight-dyn');
+    getDb().prepare("UPDATE schedule_drafts SET status='processing' WHERE id=?").run(draftId);
+    const manualEntries = [{ occurrenceDate: '2026-09-01', weekday: null, localTime: '21:00', status: 'scheduled' as const,
+      title: '人工覆盖保护', confidence: 100, sourceText: '9月1日 21:00' }];
+    updateScheduleDraftEntries(draftId, manualEntries);
+
+    expect(saveScheduleDraftRecognition(draftId, { model: 'late-model', rawResult: {}, entries: [{ ...manualEntries[0], title: '模型迟到结果' }] })).toBe(false);
+    expect(failScheduleDraftRecognition(draftId, '模型迟到失败')).toBe(false);
+    expect(getScheduleDraft(draftId)).toMatchObject({ status: 'review', entries: [{ title: '人工覆盖保护' }], error: null });
+  });
+
+  it('keeps historical media available when equal files use different source URLs', async () => {
+    const streamerId = createStreamer({ slug: 'media-alias', name: '媒体别名', biliUid: '10008', roomId: '20008' });
+    const base = { id: 'media-alias-dyn', streamerId, type: 'draw', sourceUrl: 'https://example.invalid/dynamic',
+      publishedAt: new Date().toISOString() };
+    const firstUrl = 'https://example.invalid/first.gif';
+    const secondUrl = 'https://example.invalid/second.gif';
+    const bytes = Buffer.from('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==', 'base64');
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(bytes, {
+      status: 200, headers: { 'content-type': 'image/gif', 'content-length': String(bytes.length) }
+    }));
+    try {
+      upsertDynamic({ ...base, text: '第一版', mediaUrls: [firstUrl] });
+      const firstMedia = getDb().prepare('SELECT media_id FROM dynamic_media WHERE dynamic_id=?').get(base.id) as { media_id: string };
+      await downloadMediaAsset(firstMedia.media_id);
+      upsertDynamic({ ...base, text: '第二版', mediaUrls: [secondUrl] });
+      const secondMedia = getDb().prepare('SELECT media_id FROM dynamic_media WHERE dynamic_id=?').get(base.id) as { media_id: string };
+      await downloadMediaAsset(secondMedia.media_id);
+      upsertDynamic({ ...base, text: '第三版', mediaUrls: [] });
+
+      expect(getDb().prepare('SELECT media_id FROM media_source_aliases WHERE source_url=?').get(secondUrl))
+        .toMatchObject({ media_id: firstMedia.media_id });
+      const secondRevision = listDynamicRevisions(base.id).find((revision) => revision.text === '第二版');
+      expect(secondRevision?.media[0]).toMatchObject({ sourceUrl: secondUrl, localUrl: `/media/${firstMedia.media_id}` });
+    } finally { fetchMock.mockRestore(); }
+  });
+
+  it('enforces forecast priority, marks overdue predictions stale, and evaluates live starts', () => {
+    vi.useFakeTimers();
+    const now = new Date('2026-08-29T10:00:00.000Z');
+    vi.setSystemTime(now);
+    try {
+      const streamerId = createStreamer({ slug: 'forecast-test', name: '预测测试', biliUid: '10005', roomId: '20005' });
+      upsertDynamic({ id: 'forecast-evidence', streamerId, type: 'word', text: '今晚开播', sourceUrl: 'https://example.invalid/forecast', publishedAt: now.toISOString() });
+      const eventId = upsertTimelineEvent({ streamerId, eventType: 'scheduled', plannedStartAt: '2026-08-29T12:00:00.000Z',
+        sourceType: 'dynamic', sourceId: 'forecast-evidence', confidence: 90, title: '明确动态时间' });
+      expect(eventId).toBeTruthy();
+      expect(() => setForecast({ streamerId, predictedStartAt: '2026-08-29T13:00:00.000Z', confidence: 80, source: 'pi',
+        reason: '较低优先级', evidence: [{ type: 'timeline_event', id: eventId }] }, 'test')).toThrow('更高优先级');
+      vi.setSystemTime(new Date('2026-08-29T12:05:00.000Z'));
+      updateLiveState(streamerId, 'live', '测试开播');
+      expect(getPredictionEvaluationSummary(streamerId).count).toBe(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('expires an overdue manual forecast without permanently locking automation', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-29T10:00:00.000Z'));
+    try {
+      const streamerId = createStreamer({ slug: 'manual-expiry', name: '人工过期', biliUid: '10007', roomId: '20007' });
+      setForecast({ streamerId, predictedStartAt: '2026-08-29T11:00:00.000Z', confidence: 100, source: 'manual',
+        reason: '人工预测', evidence: [] }, 'test');
+      vi.setSystemTime(new Date('2026-08-29T11:01:00.000Z'));
+      rollOverdueForecasts();
+      expect(getDb().prepare('SELECT stale FROM forecasts WHERE streamer_id=? AND active=1').get(streamerId)).toMatchObject({ stale: 1 });
+      expect(() => setForecast({ streamerId, predictedStartAt: '2026-08-29T12:00:00.000Z', confidence: 80, source: 'pi',
+        reason: '新自动预测', evidence: [] }, 'test')).not.toThrow();
+    } finally { vi.useRealTimers(); }
   });
 });

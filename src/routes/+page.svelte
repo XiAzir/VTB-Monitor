@@ -46,14 +46,21 @@
           </div>
 
           <div class="forecast">
-            {#if streamer.liveStatus === 'live'}
+            {#if streamer.forecastStatus === 'live'}
               <span class="live-now"><Radio size={17} /> LIVE</span>
               <small>已由直播间状态确认</small>
-            {:else if streamer.predictedStartAt}
+            {:else if streamer.forecastStatus === 'cancelled_today'}
+              <strong class="cancelled"><Clock3 size={17} /> 今日取消</strong><small>来自已确认日程变更</small>
+            {:else if streamer.forecastStatus === 'exact' && streamer.predictedStartAt}
               <strong><Clock3 size={17} /> {formatDateTime(streamer.predictedStartAt, { month: undefined, day: undefined })}</strong>
               <span><span class={`badge ${confidenceClass(streamer.confidence)}`}>{streamer.confidence}%</span> {sourceLabel(streamer.forecastSource)}</span>
+            {:else if streamer.forecastStatus === 'range' && streamer.predictedStartAt}
+              <strong><Clock3 size={17} /> {formatDateTime(streamer.predictedStartAt, { month: undefined, day: undefined })} ± {streamer.uncertaintyMinutes ?? 30} 分</strong>
+              <span><span class={`badge ${confidenceClass(streamer.confidence)}`}>{streamer.confidence}%</span> 时间范围</span>
+            {:else if streamer.forecastStatus === 'stale'}
+              <strong class="muted"><Clock3 size={17} /> 预测待更新</strong><small>旧预测已过期</small>
             {:else}
-              <strong class="muted"><Clock3 size={17} /> 分析中</strong><small>等待首次预测</small>
+              <strong class="muted"><Clock3 size={17} /> 信息不足</strong><small>暂无可靠开播依据</small>
             {/if}
           </div>
 
@@ -84,6 +91,7 @@
   .forecast strong { display: flex; align-items: center; gap: 7px; font-size: 19px; font-variant-numeric: tabular-nums; }
   .forecast > span { font-size: 12px; color: var(--muted); }
   .live-now { color: var(--red) !important; display: flex; align-items: center; gap: 7px; font-size: 19px !important; font-weight: 760; }
+  .cancelled { color: var(--amber); }
   .details { justify-self: end; }
   @media (max-width: 780px) {
     .monitor-row { grid-template-columns: 1fr auto; gap: 13px; }

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { BilibiliClient, BilibiliError } from './bilibili';
 import { config } from './config';
 import { getDb } from './db';
@@ -5,10 +6,11 @@ import { downloadMediaAsset } from './media';
 import {
   enqueueJob, failJob, finishJob, getDynamic, getLatestCompleteDynamicSnapshot, getSecret, leaseNextJob, rollOverdueForecasts,
   markMissingRepliesUnavailable, markMissingRootCommentsUnavailable,
-  resolveAlert, updateLiveState, updateSecretStatus, upsertAlert, upsertComment, upsertDynamic, markDynamicDeleted, markMissingDynamicsDeleted
+  resolveAlert, updateLiveState, updateRoomMapping, updateSecretStatus, upsertAlert, upsertComment, upsertDynamic,
+  markDynamicDeleted, markMissingDynamicsDeleted
 } from './store';
 import { sendAlertEmail } from './alerts';
-import { analyzeStreamerWithPi } from './pi';
+import { analyzeStreamerWithPi, recognizeScheduleDraftWithPi } from './pi';
 
 type Row = Record<string, any>;
 
@@ -39,6 +41,7 @@ export class Scheduler {
     this.timers.push(setInterval(() => void this.work(), 750));
     void this.pollLive();
     this.enqueueDueDynamicSyncs();
+    enqueueJob('repair_dynamic_archives', null, {}, 70, new Date().toISOString(), `repair-dynamics:${new Date().toISOString().slice(0, 10)}`);
     void this.work();
   }
 
@@ -67,7 +70,7 @@ export class Scheduler {
 
   private async pollLive(): Promise<void> {
     if (!this.running) return;
-    const candidates = getDb().prepare(`SELECT s.id,s.room_id,s.bili_uid,s.live_poll_seconds,ls.checked_at
+    const candidates = getDb().prepare(`SELECT s.id,s.room_id,s.resolved_room_id,s.room_mapping_status,s.bili_uid,s.live_poll_seconds,ls.checked_at
       FROM streamers s LEFT JOIN live_state ls ON ls.streamer_id=s.id WHERE s.enabled=1 ORDER BY s.id`).all() as Row[];
     const timestamp = Date.now();
     const rows = candidates.filter((row) => !row.checked_at ||
@@ -78,16 +81,20 @@ export class Scheduler {
       let client = new BilibiliClient(cookie);
       let states;
       try {
-        states = await client.fetchLiveStates(rows.map((row) => ({ roomId: String(row.room_id), biliUid: String(row.bili_uid) })));
+        states = await client.fetchLiveStates(rows.map((row) => ({ roomId: pollRoomId(row), biliUid: String(row.bili_uid) })));
       } catch (error) {
         if (!cookie || !isInvalidCookie(error)) throw error;
         upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', '直播状态抓取已自动回退到匿名模式，请尽快更新 Cookie。');
         client = new BilibiliClient(null);
-        states = await client.fetchLiveStates(rows.map((row) => ({ roomId: String(row.room_id), biliUid: String(row.bili_uid) })));
+          states = await client.fetchLiveStates(rows.map((row) => ({ roomId: pollRoomId(row), biliUid: String(row.bili_uid) })));
       }
       for (const row of rows) {
-        const state = states.get(String(row.room_id));
-        if (state) updateLiveState(String(row.id), state.status, state.title);
+        const state = states.get(pollRoomId(row));
+        if (state) {
+          updateRoomMapping(String(row.id), { resolvedRoomId: state.resolvedRoomId, shortRoomId: state.shortRoomId,
+            uid: state.uid, expectedUid: String(row.bili_uid) });
+          if (!state.uid || state.uid === String(row.bili_uid)) updateLiveState(String(row.id), state.status, state.title);
+        }
       }
     } catch (error) {
       upsertAlert('bilibili-live-poll', 'warning', '直播状态抓取失败', formatError(error));
@@ -126,6 +133,8 @@ export class Scheduler {
       case 'sync_sub_replies': return this.syncSubReplies(payload);
       case 'download_media': return downloadMediaAsset(String(job.entity_id));
       case 'pi_analyze': return analyzeStreamerWithPi(String(job.entity_id), payload);
+      case 'recognize_schedule': return recognizeScheduleDraftWithPi(String(job.entity_id));
+      case 'repair_dynamic_archives': return this.repairDynamicArchives();
       case 'send_alert_email': return sendAlertEmail(String(job.entity_id));
       case 'validate_cookie': return this.validateCookie();
       default: throw new Error(`未知任务类型：${job.type}`);
@@ -158,6 +167,7 @@ export class Scheduler {
     const streamer = getDb().prepare('SELECT * FROM streamers WHERE id=?').get(streamerId) as Row | undefined;
     if (!streamer) return;
     const fullSync = Boolean(payload.fullSync);
+    const scanId = String(payload.scanId ?? randomUUID());
     const initializing = !streamer.dynamic_history_initialized_at;
     const since = new Date();
     since.setMonth(since.getMonth() - 6);
@@ -185,7 +195,10 @@ export class Scheduler {
     for (const dynamic of dynamics) {
       const existing = getDynamic(dynamic.id);
       let enriched = dynamic;
-      if (detailBudget > 0 && (initializing || fullSync || !existing || !String(existing.text ?? '').trim() ||
+      const feedLooksChanged = Boolean(existing && (dynamic.text !== existing.text ||
+        JSON.stringify([...(dynamic.mediaUrls ?? [])].sort()) !== JSON.stringify(existing.media.map((item) => item.sourceUrl).sort())));
+      if (detailBudget > 0 && (initializing || fullSync || !existing || feedLooksChanged || !String(dynamic.text ?? '').trim() ||
+        !String(existing?.text ?? '').trim() ||
         (String(existing.text ?? '').includes('[') && Object.keys(existing.emojiMap ?? {}).length === 0))) {
         try {
           // 添加延迟以避免触发B站风控（第一个请求不延迟）
@@ -195,7 +208,8 @@ export class Scheduler {
           const detail = await client.fetchDynamicDetail(dynamic.id);
           enriched = { ...dynamic, text: detail.text || dynamic.text,
             mediaUrls: [...new Set([...(dynamic.mediaUrls ?? []), ...(detail.mediaUrls ?? [])])],
-            emojiMap: detail.emojiMap, commentOid: detail.commentOid ?? dynamic.commentOid, commentType: detail.commentType ?? dynamic.commentType };
+            emojiMap: detail.emojiMap, commentOid: detail.commentOid ?? dynamic.commentOid, commentType: detail.commentType ?? dynamic.commentType,
+            contentQuality: 'detail', detailFetchedAt: new Date().toISOString() };
           detailsFetched += 1;
         } catch (error) {
           // 只在非412错误时创建告警，避免告警泛滥
@@ -207,16 +221,23 @@ export class Scheduler {
             const archived = (existing.text.trim() || existing.media.length > 0 || Object.keys(existing.emojiMap ?? {}).length > 0)
               ? { text: existing.text, mediaUrls: existing.media.map((item) => item.sourceUrl), emojiMap: existing.emojiMap ?? {} }
               : getLatestCompleteDynamicSnapshot(dynamic.id);
-            if (archived) enriched = { ...dynamic, ...archived };
+            if (archived) enriched = { ...dynamic, ...archived, contentQuality: 'restored' };
           }
         }
         detailBudget -= 1;
+      } else if (existing && (feedLooksChanged || !String(dynamic.text ?? '').trim())) {
+        const archived = (existing.text.trim() || existing.media.length > 0 || Object.keys(existing.emojiMap ?? {}).length > 0)
+          ? { text: existing.text, mediaUrls: existing.media.map((item) => item.sourceUrl), emojiMap: existing.emojiMap ?? {} }
+          : getLatestCompleteDynamicSnapshot(dynamic.id);
+        if (archived) enriched = { ...dynamic, ...archived, contentQuality: 'restored' };
       }
-      upsertDynamic({ ...enriched, streamerId });
+      upsertDynamic({ ...enriched, streamerId, contentQuality: enriched.contentQuality ?? 'feed' });
       if (dynamic.avatarUrl) getDb().prepare('UPDATE streamers SET avatar_url=COALESCE(avatar_url,?),updated_at=? WHERE id=?').run(dynamic.avatarUrl, new Date().toISOString(), streamerId);
     }
-    if ((initializing || fullSync) && feed.complete) markMissingDynamicsDeleted(streamerId, dynamics.map((item) => item.id), since.toISOString());
-    if (initializing || fullSync) getDb().prepare('UPDATE streamers SET dynamic_history_initialized_at=COALESCE(dynamic_history_initialized_at,?),last_dynamic_full_sync_at=?,updated_at=? WHERE id=?')
+    if ((initializing || fullSync) && feed.complete) {
+      markMissingDynamicsDeleted(streamerId, dynamics.map((item) => item.id), since.toISOString(), scanId);
+    }
+    if ((initializing || fullSync) && feed.complete) getDb().prepare('UPDATE streamers SET dynamic_history_initialized_at=COALESCE(dynamic_history_initialized_at,?),last_dynamic_full_sync_at=?,updated_at=? WHERE id=?')
       .run(new Date().toISOString(), new Date().toISOString(), new Date().toISOString(), streamerId);
     getDb().prepare('UPDATE streamers SET last_dynamic_sync_at=?,updated_at=? WHERE id=?')
       .run(new Date().toISOString(), new Date().toISOString(), streamerId);
@@ -329,11 +350,35 @@ export class Scheduler {
       const current = getDb().prepare('SELECT * FROM dynamics WHERE id=?').get(dynamicId) as Row;
       upsertDynamic({ id: dynamicId, streamerId: String(row.streamer_id), type: String(current.type), text: detail.text, sourceUrl: String(current.source_url),
         publishedAt: String(current.published_at), commentOid: detail.commentOid, commentType: detail.commentType, commentCount: Number(current.comment_count), likeCount: Number(current.like_count),
-        mediaUrls: detail.mediaUrls, emojiMap: detail.emojiMap });
+        mediaUrls: detail.mediaUrls, emojiMap: detail.emojiMap, contentQuality: 'detail', detailFetchedAt: new Date().toISOString() });
     } catch (error) {
-      if (error instanceof BilibiliError && [404, 410].includes(Number(error.status))) markDynamicDeleted(dynamicId);
+      if (error instanceof BilibiliError && [404, 410].includes(Number(error.status))) {
+        const current = getDb().prepare('SELECT * FROM dynamics WHERE id=?').get(dynamicId) as Row;
+        const archived = getLatestCompleteDynamicSnapshot(dynamicId);
+        if (archived && !String(current.text ?? '').trim()) {
+          upsertDynamic({ id: dynamicId, streamerId: String(row.streamer_id), type: String(current.type), text: archived.text,
+            sourceUrl: String(current.source_url), publishedAt: String(current.published_at), commentOid: String(current.comment_oid ?? '') || null,
+            commentType: String(current.comment_type ?? '') || null, commentCount: Number(current.comment_count), likeCount: Number(current.like_count),
+            mediaUrls: archived.mediaUrls, emojiMap: archived.emojiMap, contentQuality: 'restored' });
+        }
+        markDynamicDeleted(dynamicId);
+      }
       else throw error;
     }
+  }
+
+  private async repairDynamicArchives(): Promise<void> {
+    const rows = getDb().prepare(`SELECT d.id FROM dynamics d WHERE trim(d.text)='' AND EXISTS(
+      SELECT 1 FROM dynamic_revisions dr WHERE dr.dynamic_id=d.id AND trim(dr.text)!='') ORDER BY d.updated_at LIMIT 10`).all() as Row[];
+    for (const [index, row] of rows.entries()) {
+      if (index > 0) await delay(1500);
+      try { await this.refreshDynamic(String(row.id)); }
+      catch (error) {
+        if (error instanceof BilibiliError && (error.status === 412 || error.code === 412 || error.code === 429)) throw error;
+      }
+    }
+    if (rows.length === 10) enqueueJob('repair_dynamic_archives', null, {}, 70,
+      new Date(Date.now() + 60_000).toISOString(), `repair-dynamics:${Date.now()}`);
   }
 }
 
@@ -352,6 +397,10 @@ function backoffDelay(attempt: number, error: unknown): number {
 
 function isInvalidCookie(error: unknown): boolean {
   return error instanceof BilibiliError && (error.code === -101 || error.code === -352);
+}
+
+function pollRoomId(row: Row): string {
+  return row.room_mapping_status === 'verified' && row.resolved_room_id ? String(row.resolved_room_id) : String(row.room_id);
 }
 
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }

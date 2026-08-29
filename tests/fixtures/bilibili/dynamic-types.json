@@ -1,0 +1,7 @@
+{
+  "word": { "id_str": "fixture-word", "type": "DYNAMIC_TYPE_WORD", "modules": { "module_author": { "pub_ts": 1700000000 }, "module_dynamic": { "desc": { "text": "今晚 20:00 开播" }, "major": null } } },
+  "draw": { "id_str": "fixture-draw", "type": "DYNAMIC_TYPE_DRAW", "modules": { "module_author": { "pub_ts": 1700000000 }, "module_dynamic": { "desc": { "text": "本周周表" }, "major": { "draw": { "items": [{ "src": "//i0.hdslb.com/bfs/new_dyn/schedule.png" }] } } } } },
+  "video": { "id_str": "fixture-video", "type": "DYNAMIC_TYPE_AV", "modules": { "module_author": { "pub_ts": 1700000000 }, "module_dynamic": { "desc": { "text": "新视频" }, "major": { "archive": { "cover": "https://i1.hdslb.com/bfs/archive/cover.jpg" } } } } },
+  "forward": { "id_str": "fixture-forward", "type": "DYNAMIC_TYPE_FORWARD", "modules": { "module_author": { "pub_ts": 1700000000 }, "module_dynamic": { "desc": { "text": "转发一下" }, "major": null } }, "orig": { "modules": { "module_dynamic": { "desc": { "text": "原动态" } } } } },
+  "poll": { "id_str": "fixture-poll", "type": "DYNAMIC_TYPE_COMMON_SQUARE", "modules": { "module_author": { "pub_ts": 1700000000 }, "module_dynamic": { "desc": { "text": "投票动态" }, "major": { "common": { "cover": "https://i2.hdslb.com/bfs/dynamic/poll.jpg" } } } } }
+}

@@ -1,6 +1,8 @@
-export type SourceKind = 'manual' | 'dynamic' | 'weekly_schedule' | 'pi' | 'fallback';
+export type SourceKind = 'manual' | 'dynamic' | 'schedule_confirmed' | 'weekly_schedule' | 'pi' | 'fallback';
 export type LiveStatus = 'offline' | 'live' | 'rotating' | 'unknown';
-export type SourceState = 'visible' | 'deleted' | 'unavailable';
+export type SourceState = 'visible' | 'suspected_deleted' | 'deleted' | 'unavailable';
+export type ForecastStatus = 'live' | 'cancelled_today' | 'exact' | 'range' | 'insufficient' | 'stale';
+export type RoomMappingStatus = 'unverified' | 'verified' | 'conflict';
 
 export interface StreamerSummary {
   id: string;
@@ -8,6 +10,9 @@ export interface StreamerSummary {
   name: string;
   biliUid: string;
   roomId: string;
+  resolvedRoomId: string | null;
+  roomShortId: string | null;
+  roomMappingStatus: RoomMappingStatus;
   avatarUrl: string | null;
   liveStatus: LiveStatus;
   liveTitle: string | null;
@@ -16,6 +21,8 @@ export interface StreamerSummary {
   forecastSource: SourceKind | null;
   forecastReason: string | null;
   forecastStale: boolean;
+  forecastStatus: ForecastStatus;
+  uncertaintyMinutes: number | null;
   lastCheckedAt: string | null;
 }
 
@@ -71,5 +78,21 @@ export interface ForecastRecord {
   reason: string;
   evidence: Array<{ type: string; id: string; excerpt?: string }>;
   stale: boolean;
+  uncertaintyMinutes: number | null;
   createdAt: string;
+}
+
+export interface ScheduleDraftEntry {
+  occurrenceDate: string | null;
+  weekday: number | null;
+  localTime: string | null;
+  status: 'scheduled' | 'delayed' | 'cancelled';
+  title: string;
+  confidence: number;
+  sourceText: string;
+}
+
+export interface ArchiveCursor {
+  publishedAt: string;
+  id: string;
 }

@@ -30,8 +30,9 @@
     {/if}
     <footer><span><Heart size={15} /> {data.dynamic.likeCount}</span><span><MessageSquare size={15} /> {data.dynamic.commentCount}</span></footer>
   </article>
-  <div class="dynamic-actions">{#if data.canRefresh}<form method="POST" action="?/refresh"><button class="button" type="submit"><RefreshCw size={15} /> 刷新此动态</button></form>{:else}<a class="button" href="/admin"><RefreshCw size={15} /> 登录后刷新</a>{/if}</div>
+  <div class="dynamic-actions">{#if data.canRefresh}<form method="POST" action="?/markSchedule"><button class="button" type="submit">作为周表识别</button></form><form method="POST" action="?/refresh"><button class="button" type="submit"><RefreshCw size={15} /> 刷新此动态</button></form>{:else}<a class="button" href="/admin"><RefreshCw size={15} /> 登录后刷新</a>{/if}</div>
   {#if data.revisions.length > 0}<section class="revisions panel"><strong>历史版本</strong>{#each data.revisions as revision}<a href={`/dynamics/${data.dynamic.id}?revision=${revision.id}`}>{formatDateTime(revision.createdAt)} · {revision.text || '无文字正文'}</a>{/each}</section>{/if}
+  {#if data.comparison}<section class="comparison panel"><header><strong>版本变化</strong><span>{formatDateTime(data.comparison.from.createdAt)} → {formatDateTime(data.comparison.to.createdAt)}</span></header><p class="text-diff">{#each data.comparison.text as part}<span class:added={part.added} class:removed={part.removed}>{part.value}</span>{/each}</p>{#if data.comparison.mediaAdded.length || data.comparison.mediaRemoved.length}<div class="change-row"><strong>图片</strong><span>新增 {data.comparison.mediaAdded.length} · 移除 {data.comparison.mediaRemoved.length}</span></div>{/if}{#if data.comparison.emojiAdded.length || data.comparison.emojiRemoved.length}<div class="change-row"><strong>表情</strong><span>新增 {data.comparison.emojiAdded.join('、') || '无'} · 移除 {data.comparison.emojiRemoved.join('、') || '无'}</span></div>{/if}{#if data.comparison.stateFrom !== data.comparison.stateTo}<div class="change-row"><strong>状态</strong><span>{data.comparison.stateFrom} → {data.comparison.stateTo}</span></div>{/if}</section>{/if}
 
   <div class="comments-heading"><h2>评论</h2><span>显示 {data.comments.length} / {data.totalRootComments} 条主评论</span></div>
   <div class="comments">
@@ -73,8 +74,15 @@
   .source-warning { margin-top: 15px; padding: 9px 11px; border-left: 3px solid var(--amber); background: #fff4dc; color: #6d4c15; font-size: 12px; }
   .revision-note { margin-top: 14px; color: var(--muted); font-size: 12px; }
   .revision-note a, .revisions a { color: var(--blue); }
-  .dynamic-actions { margin: 10px 0; display: flex; justify-content: flex-end; }
+  .dynamic-actions { margin: 10px 0; display: flex; gap: 8px; justify-content: flex-end; }
   .revisions { display: grid; gap: 8px; padding: 14px 17px; margin-bottom: 18px; font-size: 12px; }
+  .comparison { padding: 16px 18px; margin-bottom: 18px; }
+  .comparison header, .change-row { display: flex; justify-content: space-between; gap: 12px; }
+  .comparison header span, .change-row span { color: var(--muted); font-size: 12px; }
+  .text-diff { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.75; }
+  .text-diff .added { background: #d9f5e4; color: #126438; }
+  .text-diff .removed { background: #ffe1e1; color: #9c2626; text-decoration: line-through; }
+  .change-row { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
   .media-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
   .media-grid img, .media-missing { width: 100%; min-height: 160px; max-height: 520px; object-fit: contain; background: #f0f2f3; border-radius: 4px; }
   .media-missing { display: grid; place-items: center; align-content: center; gap: 7px; color: var(--muted); font-size: 12px; }

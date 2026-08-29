@@ -7,7 +7,7 @@ import { pipeline } from 'node:stream/promises';
 import { fileTypeFromFile } from 'file-type';
 import { config } from './config';
 import { getDb } from './db';
-import { upsertAlert } from './store';
+import { enqueueJob, upsertAlert } from './store';
 
 type Row = Record<string, unknown>;
 
@@ -67,21 +67,26 @@ export async function downloadMediaAsset(mediaId: string): Promise<void> {
       db.exec('BEGIN IMMEDIATE');
       try {
         for (const [table, owner] of [['dynamic_media', 'dynamic_id'], ['comment_media', 'comment_id']] as const) {
-          db.prepare(`INSERT OR IGNORE INTO ${table}(${owner},media_id,position) SELECT ${owner},?,position FROM ${table} WHERE media_id=?`)
+          db.prepare(`INSERT OR IGNORE INTO ${table}(${owner},media_id,position,source_url)
+            SELECT ${owner},?,position,source_url FROM ${table} WHERE media_id=?`)
             .run(existingId, mediaId);
           db.prepare(`DELETE FROM ${table} WHERE media_id=?`).run(mediaId);
         }
+        db.prepare(`INSERT INTO media_source_aliases(source_url,media_id,created_at) VALUES (?, ?, ?)
+          ON CONFLICT(source_url) DO UPDATE SET media_id=excluded.media_id`).run(sourceUrl, existingId, new Date().toISOString());
         db.prepare('DELETE FROM media_assets WHERE id=?').run(mediaId);
         db.exec('COMMIT');
       } catch (error) {
         db.exec('ROLLBACK');
         throw error;
       }
+      enqueuePendingScheduleDrafts(existingId);
       return;
     }
     await rename(tempPath, finalPath);
     db.prepare(`UPDATE media_assets SET sha256=?,local_path=?,mime_type=?,byte_size=?,state='stored',error=NULL,updated_at=? WHERE id=?`)
       .run(sha256, relative, detected.mime, bytes, new Date().toISOString(), mediaId);
+    enqueuePendingScheduleDrafts(mediaId);
   } catch (error) {
     await rm(tempPath, { force: true });
     const message = error instanceof Error ? error.message : String(error);
@@ -89,6 +94,19 @@ export async function downloadMediaAsset(mediaId: string): Promise<void> {
     db.prepare('UPDATE media_assets SET state=?,error=?,updated_at=? WHERE id=?')
       .run(state, message.slice(0, 1000), new Date().toISOString(), mediaId);
     throw error;
+  }
+}
+
+function enqueuePendingScheduleDrafts(mediaId: string): void {
+  const mediaUrls = (getDb().prepare(`SELECT source_url FROM media_assets WHERE id=? UNION ALL
+    SELECT source_url FROM media_source_aliases WHERE media_id=?`).all(mediaId, mediaId) as Row[]).map((row) => String(row.source_url));
+  if (mediaUrls.length === 0) return;
+  const rows = getDb().prepare("SELECT id,media_urls_json FROM schedule_drafts WHERE status='pending'").all() as Row[];
+  for (const row of rows) {
+    let urls: string[] = [];
+    try { urls = JSON.parse(String(row.media_urls_json)) as string[]; } catch { /* malformed draft stays available for review */ }
+    if (urls.some((url) => mediaUrls.includes(url))) enqueueJob('recognize_schedule', String(row.id), {}, 40,
+      new Date().toISOString(), `recognize-schedule-media:${row.id}:${mediaId}`);
   }
 }
 

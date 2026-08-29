@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Activity, AlertTriangle, Bot, Database, History, KeyRound, LogOut, Mail, Plus, Radio, RefreshCw, ServerCog, Settings2, Users } from '@lucide/svelte';
+  import { Activity, AlertTriangle, Bot, CalendarDays, Database, History, KeyRound, LogOut, Mail, Plus, Radio, RefreshCw, ServerCog, Settings2, Users } from '@lucide/svelte';
   import PiChat from '$lib/components/PiChat.svelte';
   import { formatDateTime, relativeTime } from '$lib/format';
   let { data, form } = $props();
@@ -27,6 +27,7 @@
     {#if form?.saved}<div class="notice top-notice">{form.saved}</div>{/if}
     {#if form?.apiToken}<div class="token-reveal"><strong>令牌仅显示一次</strong><code>{form.apiToken}</code></div>{/if}
 
+    <div class="admin-shortcuts"><a class="button" href="/admin/schedules"><CalendarDays size={15} /> 审核周表识别</a></div>
     <div class="stats-grid">
       <div class="stat panel"><Users size={18} /><strong>{data.stats.streamers}</strong><span>监控主播</span></div>
       <div class="stat panel"><Activity size={18} /><strong>{data.stats.dynamics}</strong><span>历史动态</span></div>
