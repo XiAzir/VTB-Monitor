@@ -57,45 +57,46 @@
 </section>
 
 <style>
-  .narrow { width: min(820px, calc(100% - 36px)); }
-  .back { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 17px; color: var(--muted); font-size: 13px; }
-  .dynamic-detail { padding: 20px; }
+  .narrow { width: min(820px, calc(100% - 40px)); }
+  .back { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 16px; color: var(--muted); font-size: 13.5px; }
+  .back:hover { color: var(--pink-ink); }
+  .dynamic-detail { padding: 20px 22px; }
   .dynamic-detail header { display: flex; align-items: center; justify-content: space-between; }
   .dynamic-detail header > div { display: grid; gap: 4px; }
-  .dynamic-detail time { color: var(--muted); font-size: 12px; }
-  .source-warning { margin-top: 15px; padding: 9px 11px; border-left: 3px solid var(--amber); background: #fff4dc; color: #6d4c15; font-size: 12px; }
-  .revision-note { margin-top: 14px; color: var(--muted); font-size: 12px; }
+  .dynamic-detail time { color: var(--muted-2); font-size: 12px; }
+  .source-warning { margin-top: 15px; padding: 11px 14px; border: 1px solid rgb(250 178 25 / 34%); border-radius: var(--r); background: var(--amber-tint); color: var(--amber); font-size: 12.5px; }
+  .revision-note { margin-top: 14px; color: var(--muted); font-size: 12.5px; }
   .revision-note a, .revisions a { color: var(--blue); }
-  .dynamic-actions { margin: 10px 0; display: flex; gap: 8px; justify-content: flex-end; }
-  .revisions { display: grid; gap: 8px; padding: 14px 17px; margin-bottom: 18px; font-size: 12px; }
-  .comparison { padding: 16px 18px; margin-bottom: 18px; }
+  .dynamic-actions { margin: 12px 0; display: flex; gap: 8px; justify-content: flex-end; }
+  .revisions { display: grid; gap: 9px; padding: 16px 18px; margin-bottom: 18px; font-size: 12.5px; }
+  .comparison { padding: 17px 20px; margin-bottom: 18px; }
   .comparison header, .change-row { display: flex; justify-content: space-between; gap: 12px; }
   .comparison header span, .change-row span { color: var(--muted); font-size: 12px; }
-  .text-diff { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.75; }
-  .text-diff .added { background: #d9f5e4; color: #126438; }
-  .text-diff .removed { background: #ffe1e1; color: #9c2626; text-decoration: line-through; }
-  .change-row { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
-  .dynamic-detail footer { display: flex; gap: 20px; margin-top: 18px; padding-top: 13px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+  .text-diff { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.78; }
+  .text-diff .added { background: var(--green-tint); color: var(--green); }
+  .text-diff .removed { background: var(--pink-tint); color: var(--pink-ink); text-decoration: line-through; }
+  .change-row { border-top: 1px solid var(--line-soft); padding-top: 10px; margin-top: 10px; }
+  .dynamic-detail footer { display: flex; gap: 20px; margin-top: 18px; padding-top: 13px; border-top: 1px solid var(--line-soft); color: var(--muted-2); font-size: 12.5px; }
   .dynamic-detail footer span, .comment-stats { display: inline-flex; align-items: center; gap: 5px; }
-  .comments-heading { display: flex; align-items: baseline; justify-content: space-between; margin: 28px 0 12px; }
+  .comments-heading { display: flex; align-items: baseline; justify-content: space-between; margin: 30px 0 14px; }
   .comments-heading h2 { margin: 0; font-size: 18px; }
-  .comments-heading span { color: var(--muted); font-size: 12px; }
-  .comments { display: grid; gap: 9px; }
-  .comment-pages { display: flex; justify-content: space-between; gap: 10px; margin-top: 14px; }
-  .comment { padding: 15px 17px; }
-  .comment-author { display: flex; align-items: center; gap: 9px; }
-  .comment-author img, .comment-author > span:first-child { width: 34px; height: 34px; border-radius: 50%; background: #e7eaec; }
+  .comments-heading span { color: var(--muted); font-size: 12.5px; }
+  .comments { display: grid; gap: 12px; }
+  .comment-pages { display: flex; justify-content: space-between; gap: 10px; margin-top: 18px; }
+  .comment { padding: 16px 18px; }
+  .comment-author { display: flex; align-items: center; gap: 10px; }
+  .comment-author img, .comment-author > span:first-child { width: 36px; height: 36px; border-radius: 50%; object-fit: cover; background: #eef1f3; }
   .comment-author > div { display: grid; gap: 2px; margin-right: auto; }
-  .comment-author strong { font-size: 13px; }
-  .comment-author small, .reply small { color: var(--muted); font-size: 11px; }
+  .comment-author strong { font-size: 13.5px; font-weight: 650; }
+  .comment-author small, .reply small { color: var(--muted-2); font-size: 11.5px; }
   .signal { color: var(--blue); }
-  .comment > p { margin: 12px 0; line-height: 1.68; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .deleted { color: var(--red); }
+  .comment > p { margin: 12px 0; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; }
+  .deleted { color: var(--pink-ink); }
   .comment-media { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0; }
-  .comment-media img { width: 112px; height: 112px; object-fit: cover; border-radius: 4px; }
-  .comment-stats { color: var(--muted); font-size: 11px; }
-  .replies { display: grid; gap: 8px; margin-top: 12px; padding: 11px; background: #f3f5f6; border-radius: 4px; }
-  .reply { display: grid; grid-template-columns: auto auto 1fr auto; align-items: baseline; gap: 6px; font-size: 12px; }
+  .comment-media img { width: 112px; height: 112px; object-fit: cover; border-radius: var(--r-sm); }
+  .comment-stats { color: var(--muted-2); font-size: 11.5px; }
+  .replies { display: grid; gap: 8px; margin-top: 12px; padding: 12px 14px; background: var(--surface-muted); border: 1px solid var(--line-soft); border-radius: var(--r); }
+  .reply { display: grid; grid-template-columns: auto auto 1fr auto; align-items: baseline; gap: 6px; font-size: 12.5px; }
   .reply span { overflow-wrap: anywhere; }
   @media (max-width: 560px) { .reply { grid-template-columns: auto auto 1fr; } .reply small { grid-column: 3; } }
 </style>

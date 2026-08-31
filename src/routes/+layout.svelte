@@ -1,6 +1,7 @@
 <script lang="ts">
   import '../styles/app.css';
-  import { Activity, Shield } from '@lucide/svelte';
+  import { Inbox, LayoutGrid, Shield } from '@lucide/svelte';
+  import { page } from '$app/state';
   let { children } = $props();
 </script>
 
@@ -11,13 +12,17 @@
 
 <header class="site-header">
   <a class="brand" href="/" aria-label="监控室老大爷首页">
-    <span class="brand-mark"><Activity size={19} strokeWidth={2.2} /></span>
-    <span>监控室老大爷</span>
+    <span class="brand-mark"><Inbox size={19} strokeWidth={2.2} /></span>
+    <span class="brand-text">监控室老大爷</span>
   </a>
   <nav aria-label="主导航">
-    <a href="/">监控台</a>
-    <a class="icon-link" href="/admin" title="后台管理" aria-label="后台管理"><Shield size={18} /></a>
+    <a href="/" aria-current={page.url.pathname === '/' ? 'page' : undefined}><LayoutGrid size={15} /> 监控台</a>
+    <a class="button primary" href="/admin" aria-label="后台管理"><Shield size={14} /> 后台</a>
   </nav>
 </header>
 
 <main>{@render children()}</main>
+
+<style>
+  @media (max-width: 640px) { .brand-text { display: none; } }
+</style>
