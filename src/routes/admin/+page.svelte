@@ -20,6 +20,7 @@
   function statusLabel(status: unknown): string { return statusLabels[String(status)] ?? String(status); }
   function auditLabel(action: unknown): string { return auditLabels[String(action)] ?? String(action).replaceAll('.', ' · '); }
   function actorLabel(actor: unknown): string { return actorLabels[String(actor)] ?? String(actor); }
+  const liveLabels: Record<string, string> = { live: '直播中', rotating: '轮播中', offline: '未开播', unknown: '状态未知' };
 </script>
 
 <svelte:head><title>后台管理 · 监控室老大爷</title></svelte:head>
@@ -61,7 +62,7 @@
           <div class="panel table-wrap">
             <table><thead><tr><th>主播</th><th>状态</th><th>预测</th><th>最近检查</th><th>操作</th></tr></thead>
               <tbody>{#each data.streamers as streamer}<tr><td><strong>{streamer.name}</strong><small>UID {streamer.biliUid} · {streamer.roomId}</small></td>
-                <td><span class={`badge ${streamer.liveStatus}`}>{streamer.liveStatus}</span></td><td>{streamer.predictedStartAt ? formatDateTime(streamer.predictedStartAt) : '分析中'}</td>
+                <td><span class={`badge ${streamer.liveStatus}`}><span class:live={streamer.liveStatus === 'live'} class="dot"></span> {liveLabels[streamer.liveStatus] ?? streamer.liveStatus}</span></td><td>{streamer.predictedStartAt ? formatDateTime(streamer.predictedStartAt) : '分析中'}</td>
                 <td>{relativeTime(streamer.lastCheckedAt)}</td><td><form class="row-actions" method="POST" action="?/runOperation"><input type="hidden" name="streamerId" value={streamer.id} />
                   <button class="icon-button" name="operation" value="sync" title="立即同步" aria-label="立即同步"><RefreshCw size={15} /></button>
                   <button class="icon-button" name="operation" value="refresh" title="重新导入半年动态" aria-label="重新导入半年动态"><History size={15} /></button>
@@ -81,7 +82,7 @@
                 <div class="field wide"><label for={`edit-live-${streamer.id}`}>直播间主页</label><input id={`edit-live-${streamer.id}`} name="liveUrl" value={streamer.liveUrl} required /></div>
                 <div class="field"><label for={`edit-live-poll-${streamer.id}`}>直播轮询（秒）</label><input id={`edit-live-poll-${streamer.id}`} name="livePollSeconds" type="number" min="15" max="600" value={streamer.livePollSeconds} /></div>
                 <div class="field"><label for={`edit-dynamic-poll-${streamer.id}`}>动态轮询（秒）</label><input id={`edit-dynamic-poll-${streamer.id}`} name="dynamicPollSeconds" type="number" min="180" max="3600" value={streamer.dynamicPollSeconds} /></div>
-                <label class="checkbox"><input name="enabled" type="checkbox" checked={streamer.enabled} /> 启用监控</label><button class="button" type="submit">保存配置</button>
+                <label class="checkbox"><input name="enabled" type="checkbox" checked={streamer.enabled} /> 启用监控</label><button class="button primary" type="submit">保存配置</button>
               </form>
             </details>
           {/each}
@@ -106,14 +107,14 @@
               <div class="field"><label for="predictedStartAt">预计时间</label><input id="predictedStartAt" name="predictedStartAt" type="datetime-local" required /></div>
               <div class="field"><label for="forecast-confidence">置信度</label><input id="forecast-confidence" name="confidence" type="number" min="0" max="100" value="100" required /></div>
               <div class="field"><label for="forecast-reason">公开说明</label><input id="forecast-reason" name="reason" value="管理员人工设置" required /></div>
-              <button class="button" type="submit">保存并锁定</button>
+              <button class="button primary" type="submit">保存并锁定</button>
             </form>
             <form class="panel form-panel" method="POST" action="?/saveManualSchedule">
               <div class="form-title"><Activity size={17} /><strong>替换人工周表</strong></div>
               <div class="field"><label for="schedule-streamer">主播</label><select id="schedule-streamer" name="streamerId" required>{#each data.streamers as streamer}<option value={streamer.id}>{streamer.name}</option>{/each}</select></div>
               <div class="field"><label for="schedule-rules">周表（星期 时间 标题）</label><textarea id="schedule-rules" name="rules" rows="6" placeholder={'1 20:00 杂谈\n3 19:30 游戏\n7 20:00 周末直播'}></textarea></div>
               <p class="form-help">星期使用 1 至 7 表示周一至周日；留空保存可清除人工周表。</p>
-              <button class="button" type="submit">保存并锁定</button>
+              <button class="button primary" type="submit">保存并锁定</button>
             </form>
           </div>
         </section>
@@ -124,14 +125,14 @@
             <form class="panel form-panel" method="POST" action="?/changePassword"><div class="form-title"><KeyRound size={17} /><strong>修改管理员密码</strong></div>
               <div class="field"><label for="new-password">新密码</label><input id="new-password" name="password" type="password" minlength="10" autocomplete="new-password" required /></div>
               <div class="field"><label for="confirm-password">再次输入</label><input id="confirm-password" name="confirm" type="password" minlength="10" autocomplete="new-password" required /></div>
-              <button class="button" type="submit">更新密码</button></form>
+              <button class="button primary" type="submit">更新密码</button></form>
             <form class="panel form-panel" method="POST" action="?/saveCookie"><div class="form-title"><Radio size={17} /><strong>B站 Cookie</strong></div>
               <p class="form-help">失效时自动回退匿名抓取并发送告警。</p><div class="field"><label for="cookie">替换 Cookie</label><textarea id="cookie" name="cookie" autocomplete="off" required></textarea></div>
-              <button class="button" type="submit">加密保存并验证</button></form>
+              <button class="button primary" type="submit">加密保存并验证</button></form>
             <form class="panel form-panel" method="POST" action="?/saveBilibiliProxy"><div class="form-title"><ServerCog size={17} /><strong>B站请求代理</strong></div>
               <p class="form-help">仅用于 B站 API、动态详情和直播状态请求；留空使用直连。</p>
               <div class="field"><label for="bilibili-proxy">HTTP(S) 代理 URL</label><input id="bilibili-proxy" name="proxyUrl" value={data.bilibiliProxyUrl || ''} placeholder="http://127.0.0.1:7890" /></div>
-              <button class="button" type="submit">保存并验证</button></form>
+              <button class="button primary" type="submit">保存并验证</button></form>
             <form class="panel form-panel" method="POST" action="?/savePi"><div class="form-title"><Bot size={17} /><strong>Pi Provider</strong><span class={`badge ${data.pi.configured ? 'high' : 'low'}`}>{data.pi.configured ? '已配置' : '未配置'}</span></div>
               <div class="field"><label for="provider">Provider</label><select id="provider" name="provider" value={data.pi.profile.provider}><option value="openai">OpenAI Responses</option><option value="anthropic">Anthropic Messages</option><option value="google">Google Generative AI</option><option value="openrouter">OpenAI Chat / OpenRouter</option></select></div>
               <div class="field"><label for="modelId">模型 ID</label><input id="modelId" name="modelId" value={data.pi.profile.modelId} required /></div>
@@ -142,7 +143,7 @@
               <label class="checkbox"><input name="reasoning" type="checkbox" checked={data.pi.profile.reasoning || false} /> 启用模型推理</label>
               <label class="checkbox"><input name="sessionAffinity" type="checkbox" checked={data.pi.profile.sessionAffinity || false} /> 启用会话亲和</label>
               <p class="form-help">输入：文字{data.pi.profile.input?.includes('image') ? '、图片' : ''}；输出：文字。</p>
-              <button class="button" type="submit">保存 Pi 配置</button></form>
+              <button class="button primary" type="submit">保存 Pi 配置</button></form>
           </div>
         </section>
 
@@ -163,11 +164,11 @@
               <div class="field"><label for="smtp-host">服务器</label><input id="smtp-host" name="host" value={data.smtp?.host || ''} /></div><div class="field"><label for="smtp-port">端口</label><input id="smtp-port" name="port" type="number" value={data.smtp?.port || 587} /></div>
               <div class="field"><label for="smtp-username">用户名</label><input id="smtp-username" name="username" value={data.smtp?.username || ''} /></div><div class="field"><label for="smtp-password">替换密码</label><input id="smtp-password" name="password" type="password" /></div>
               <div class="field"><label for="smtp-from">发件人</label><input id="smtp-from" name="from" value={data.smtp?.from || ''} /></div><div class="field"><label for="smtp-to">收件人</label><input id="smtp-to" name="to" value={data.smtp?.to || ''} /></div>
-              <label class="checkbox"><input name="secure" type="checkbox" checked={data.smtp?.secure || false} /> 使用隐式 TLS</label><button class="button" type="submit">保存 SMTP</button></form>
+              <label class="checkbox"><input name="secure" type="checkbox" checked={data.smtp?.secure || false} /> 使用隐式 TLS</label><button class="button primary" type="submit">保存 SMTP</button></form>
             <form class="panel form-panel" method="POST" action="?/createToken"><div class="form-title"><KeyRound size={17} /><strong>创建管理 API 令牌</strong></div>
               <div class="field"><label for="token-name">令牌名称</label><input id="token-name" name="name" value="server-agent" required /></div>
               {#each ['status:read','config:read','config:write','ops:run','audit:read','secrets:read','secrets:write'] as scope}<label class="checkbox"><input type="checkbox" name="scope" value={scope} /> {scope}</label>{/each}
-              <button class="button" type="submit">创建一次性令牌</button>
+              <button class="button primary" type="submit">创建一次性令牌</button>
               {#if data.tokens.length > 0}<div class="token-list">{#each data.tokens as token}<div><span><strong>{String(token.name)}</strong><small>{String(token.token_prefix)}… · {token.revoked_at ? '已撤销' : '有效'}</small></span>{#if !token.revoked_at}<button class="button danger" type="submit" formaction="?/revokeToken" name="tokenId" value={String(token.id)}>撤销</button>{/if}</div>{/each}</div>{/if}
             </form>
           </div>
@@ -180,23 +181,76 @@
 {/if}
 
 <style>
-  .login-page { min-height: calc(100vh - 58px); display: grid; place-items: center; padding: 24px; }
-  .login { width: min(380px, 100%); display: grid; gap: 16px; padding: 26px; }
-  .login-icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 6px; background: #202427; color: white; }
-  .login h1 { margin: 0; font-size: 21px; }.login p { margin: -10px 0 0; color: var(--muted); font-size: 13px; }
-  .top-notice, .token-reveal { margin-bottom: 14px; }.token-reveal { display: grid; gap: 7px; padding: 12px; border: 1px solid #deb969; background: #fff5dc; }.token-reveal code { overflow-wrap: anywhere; }
-  .token-list { display: grid; border-top: 1px solid var(--line); }.token-list > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 9px; }.token-list span { min-width: 0; }.token-list strong, .token-list small { display: block; overflow: hidden; text-overflow: ellipsis; }.token-list small { margin-top: 2px; color: var(--muted); font-size: 10px; }.token-list .button { min-height: 30px; padding: 0 9px; font-size: 11px; }
-  .stats-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 28px; }
-  .stat { min-height: 92px; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 3px 9px; padding: 14px; }.stat :global(svg) { grid-row: 1 / 3; color: var(--muted); }.stat strong { font-size: 22px; }.stat span { color: var(--muted); font-size: 11px; }
-  .admin-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 24px; align-items: start; }.admin-main { min-width: 0; display: grid; gap: 32px; }.admin-main > section, .admin-grid aside, .settings-grid > *, .split-list > * { min-width: 0; }.admin-grid aside { display: grid; gap: 16px; position: sticky; top: 78px; }
-  .section-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }.section-title > div, .form-title { display: flex; align-items: center; gap: 8px; }.section-title h2 { margin: 0; font-size: 17px; }
-  .table-wrap { overflow: auto; }table { width: 100%; border-collapse: collapse; font-size: 12px; }th,td { padding: 11px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }th { color: var(--muted); background: #f5f6f7; font-weight: 650; }td strong,td small { display: block; }td small { margin-top: 3px; color: var(--muted); }.row-actions { display: flex; gap: 5px; }.row-actions .icon-button { width: 31px; height: 31px; }
-  .form-panel { display: grid; gap: 12px; padding: 15px; }.four-cols { grid-template-columns: repeat(4, 1fr) auto; align-items: end; margin-top: 10px; }.four-cols .form-title { grid-column: 1 / -1; }.four-cols .button { margin-bottom: 1px; }
-  .streamer-editor { margin-top: 8px; }.streamer-editor summary { cursor: pointer; padding: 11px 13px; font-size: 12px; font-weight: 650; }.streamer-editor .form-panel { border-top: 1px solid var(--line); }.four-cols .wide { grid-column: span 2; }
-  .settings-grid, .split-list { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: start; }.form-help { margin: -5px 0 0; color: var(--muted); font-size: 11px; }.checkbox { display: flex; align-items: center; gap: 7px; font-size: 12px; }
-  .list-panel h3, .audit h3 { margin: 0; padding: 12px; border-bottom: 1px solid var(--line); font-size: 13px; }.list-row, .audit > div { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--line); }.list-row:last-child, .audit > div:last-child { border-bottom: 0; }.list-row > div, .audit > div { min-width: 0; }.list-row strong, .list-row small, .audit strong, .audit small { display: block; }.list-row small, .audit small, .list-row time { margin-top: 3px; color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; }.list-row .button { min-height: 30px; padding: 0 9px; font-size: 11px; }
-  .list-heading { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }.list-heading h3 { border-bottom: 0; }.list-heading form { margin-right: 10px; }.list-heading .button { min-height: 30px; padding: 0 9px; font-size: 11px; }
-  .empty.small { padding: 25px 12px; }.audit { overflow: hidden; }.audit > div { display: grid; justify-content: stretch; }
-  @media (max-width: 1050px) { .admin-grid { grid-template-columns: minmax(0, 1fr); }.admin-grid aside { position: static; }.stats-grid { grid-template-columns: repeat(3, 1fr); } }
-  @media (max-width: 760px) { .four-cols, .settings-grid, .split-list { grid-template-columns: 1fr; }.four-cols .form-title, .four-cols .wide { grid-column: 1; }.stats-grid { grid-template-columns: repeat(2, 1fr); } }
+  .login-page { min-height: calc(100vh - 64px); display: grid; place-items: center; padding: 24px; }
+  .login { width: min(380px, 100%); display: grid; gap: 14px; padding: 30px; justify-items: stretch; }
+  .login-icon { width: 42px; height: 42px; justify-self: center; display: grid; place-items: center; border-radius: 14px; color: #fff; background: linear-gradient(145deg, var(--pink-soft), var(--pink)); box-shadow: 0 5px 14px -4px rgb(251 114 153 / 60%); }
+  .login h1 { margin: 0; font-size: 20px; text-align: center; }
+  .login p { margin: -8px 0 0; color: var(--muted); font-size: 13px; text-align: center; }
+  .login .button { width: 100%; }
+  .top-notice, .token-reveal { margin-bottom: 14px; }
+  .token-reveal { display: grid; gap: 7px; padding: 13px 15px; border: 1px solid rgb(250 178 25 / 34%); border-radius: var(--r); background: var(--amber-tint); color: var(--amber); }
+  .token-reveal code { overflow-wrap: anywhere; font-size: 12.5px; }
+  .admin-shortcuts { display: flex; gap: 9px; margin-bottom: 14px; }
+  .token-list { display: grid; gap: 9px; margin-top: 4px; padding-top: 11px; border-top: 1px solid var(--line-soft); }
+  .token-list > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .token-list span { min-width: 0; }
+  .token-list strong, .token-list small { display: block; overflow: hidden; text-overflow: ellipsis; }
+  .token-list small { margin-top: 2px; color: var(--muted-2); font-size: 11.5px; }
+  .token-list .button { min-height: 31px; padding: 0 12px; font-size: 12.5px; }
+
+  .stats-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin-bottom: 30px; }
+  .stat { min-height: 96px; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 4px 11px; padding: 18px; }
+  .stat :global(svg) { grid-row: 1 / 3; width: 30px; height: 30px; padding: 7px; border-radius: var(--r-sm); background: var(--pink-tint); color: var(--pink-ink); }
+  .stat strong { font-size: 26px; font-weight: 700; line-height: 1; }
+  .stat span { color: var(--muted); font-size: 12px; }
+
+  .admin-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 24px; align-items: start; }
+  .admin-main { min-width: 0; display: grid; gap: 34px; }
+  .admin-main > section, .admin-grid aside, .settings-grid > *, .split-list > * { min-width: 0; }
+  .admin-grid aside { display: grid; gap: 18px; position: sticky; top: 84px; }
+  .section-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .section-title > div, .form-title { display: flex; align-items: center; gap: 9px; }
+  .section-title h2 { margin: 0; font-size: 18px; }
+  .form-title { font-size: 15px; }
+  .form-title :global(svg) { color: var(--pink-ink); }
+  .form-title .badge { margin-left: auto; }
+
+  .table-wrap { overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 12px 18px; text-align: left; border-bottom: 1px solid var(--line-soft); white-space: nowrap; }
+  th { padding-bottom: 9px; color: var(--muted-2); font-size: 12px; font-weight: 600; }
+  tr:last-child td { border-bottom: 0; }
+  td strong, td small { display: block; }
+  td strong { font-weight: 620; }
+  td small { margin-top: 2px; color: var(--muted-2); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .row-actions { display: flex; justify-content: flex-end; gap: 7px; }
+  .row-actions .icon-button { width: 30px; height: 30px; }
+
+  .form-panel { display: grid; gap: 13px; padding: 18px 20px; align-content: start; }
+  .four-cols { grid-template-columns: repeat(4, 1fr) auto; align-items: end; margin-top: 12px; background: var(--surface-muted); }
+  .four-cols .form-title { grid-column: 1 / -1; }
+  .four-cols .wide { grid-column: span 2; }
+  .streamer-editor { margin-top: 9px; overflow: hidden; }
+  .streamer-editor summary { cursor: pointer; padding: 13px 18px; font-size: 12.5px; font-weight: 650; color: var(--muted); }
+  .streamer-editor summary:hover { color: var(--text); }
+  .streamer-editor .form-panel { border-top: 1px solid var(--line-soft); }
+  .settings-grid, .split-list { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+  .form-help { margin: -6px 0 0; color: var(--muted-2); font-size: 12px; line-height: 1.6; }
+
+  .list-panel h3, .audit h3, .list-heading h3 { margin: 0; padding: 15px 18px; border-bottom: 1px solid var(--line-soft); font-size: 14.5px; }
+  .list-row, .audit > div { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--line-soft); }
+  .list-row:last-child, .audit > div:last-child { border-bottom: 0; }
+  .list-row > div, .audit > div { min-width: 0; }
+  .list-row strong, .audit strong { display: block; font-size: 13.5px; font-weight: 620; }
+  .list-row small, .audit small, .list-row time { display: block; margin-top: 3px; color: var(--muted-2); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .list-row .button { min-height: 31px; padding: 0 12px; font-size: 12.5px; }
+  .list-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid var(--line-soft); }
+  .list-heading h3 { border-bottom: 0; }
+  .list-heading form { margin-right: 14px; }
+  .list-heading .button { min-height: 31px; padding: 0 12px; font-size: 12.5px; }
+  .audit { overflow: hidden; }
+  .audit > div { display: grid; justify-content: stretch; }
+
+  @media (max-width: 1050px) { .admin-grid { grid-template-columns: minmax(0, 1fr); } .admin-grid aside { position: static; } .stats-grid { grid-template-columns: repeat(3, 1fr); } .table-wrap { overflow: auto; } }
+  @media (max-width: 760px) { .four-cols, .settings-grid, .split-list { grid-template-columns: 1fr; } .four-cols .form-title, .four-cols .wide { grid-column: 1; } .stats-grid { grid-template-columns: repeat(2, 1fr); } }
 </style>

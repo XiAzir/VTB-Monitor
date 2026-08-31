@@ -25,25 +25,31 @@
 </section>
 
 <style>
-  .back { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
-  .status-tabs { display: flex; gap: 16px; margin: 12px 0; font-size: 13px; }
-  .status-tabs a { color: var(--blue); }
+  .back { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13.5px; }
+  .back:hover { color: var(--pink-ink); }
+  .status-tabs { display: flex; gap: 6px; margin: 14px 0; font-size: 13.5px; }
+  .status-tabs a { height: 34px; display: inline-flex; align-items: center; padding: 0 14px; border-radius: 999px; border: 1px solid var(--line); background: #fff; color: var(--muted); }
+  .status-tabs a:hover { color: var(--pink-ink); border-color: var(--pink-soft); background: var(--pink-tint); }
   .schedule-layout { display: grid; grid-template-columns: 320px minmax(0,1fr); gap: 16px; align-items: start; }
   .draft-list { overflow: hidden; }
-  .draft-list a { display: grid; gap: 4px; padding: 13px 15px; border-bottom: 1px solid var(--line); }
-  .draft-list a.active { background: #eef6fb; }
-  .draft-list span, .draft-list p { color: var(--muted); font-size: 11px; }
+  .draft-list a { display: grid; gap: 4px; padding: 14px 18px; border-bottom: 1px solid var(--line-soft); }
+  .draft-list a:last-child { border-bottom: 0; }
+  .draft-list a.active { background: var(--pink-tint); }
+  .draft-list span, .draft-list p { color: var(--muted-2); font-size: 11.5px; }
   .draft-list p { margin: 3px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .draft-editor { padding: 18px; }
+  .draft-editor { padding: 20px 22px; }
   .draft-editor header { display: flex; justify-content: space-between; align-items: center; }
   .draft-editor header > div { display: grid; gap: 4px; }
-  .draft-editor header span { color: var(--muted); font-size: 12px; }
+  .draft-editor header span { color: var(--muted); font-size: 12.5px; }
   .draft-images { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; margin: 16px 0; }
-  .draft-images img { width: 100%; max-height: 420px; object-fit: contain; background: #f1f3f4; }
-  .source-text { white-space: pre-wrap; line-height: 1.6; }
-  .draft-editor label { display: block; margin: 8px 0 5px; color: var(--muted); font-size: 12px; }
-  .draft-editor textarea { width: 100%; resize: vertical; font-family: ui-monospace,monospace; font-size: 12px; }
-  .review-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin-top: 14px; }
+  .draft-images img { width: 100%; max-height: 420px; object-fit: contain; border-radius: var(--r-sm); background: var(--surface-muted); }
+  .source-text { white-space: pre-wrap; line-height: 1.75; }
+  .draft-editor label { display: block; margin: 10px 0 6px; color: var(--muted); font-size: 12px; font-weight: 600; }
+  .draft-editor textarea { width: 100%; resize: vertical; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-sm); font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12.5px; outline: none; }
+  .draft-editor textarea:focus { border-color: var(--pink); box-shadow: 0 0 0 3px rgb(251 114 153 / 16%); }
+  .draft-editor input[type='date'] { min-height: 36px; padding: 0 12px; border: 1px solid var(--line); border-radius: var(--r-sm); background: #fff; }
+  .draft-editor form > .button { margin-top: 10px; }
+  .review-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin-top: 16px; }
   .review-actions form:first-child { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin-right: auto; }
   @media (max-width: 780px) { .schedule-layout { grid-template-columns: 1fr; } .draft-images { grid-template-columns: 1fr; } }
 </style>

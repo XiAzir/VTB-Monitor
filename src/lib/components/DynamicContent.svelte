@@ -96,37 +96,37 @@
 </div>
 
 <style>
-  .dynamic-content { display: grid; gap: 12px; margin: 14px 0; }
-  .dynamic-content > p { margin: 0; line-height: 1.72; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .dynamic-content { display: grid; gap: 13px; margin: 14px 0; }
+  .dynamic-content > p { margin: 0; line-height: 1.78; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14.5px; }
   .rich-text :global(.inline-emoji) { width: 1.6em; height: 1.6em; vertical-align: -0.35em; object-fit: contain; }
   .empty-text { color: var(--muted); }
-  .type-label { width: fit-content; padding: 3px 7px; border: 1px solid #d9a8b7; border-radius: 4px; color: #8c3451; background: #fff4f7; font-size: 11px; font-weight: 700; }
-  .video-card { min-width: 0; display: grid; grid-template-columns: minmax(180px, 42%) 1fr; overflow: hidden; color: inherit; border: 1px solid var(--line); border-radius: 5px; background: #fafbfb; }
-  .video-cover { position: relative; min-height: 128px; background: #e9edef; }
+  .type-label { width: fit-content; padding: 3px 9px; border-radius: 999px; color: var(--pink-ink); background: var(--pink-tint); font-size: 11.5px; font-weight: 650; }
+  .video-card { min-width: 0; display: grid; grid-template-columns: minmax(180px, 42%) 1fr; overflow: hidden; color: inherit; border: 1px solid var(--line-soft); border-radius: var(--r); background: var(--surface-muted); }
+  .video-cover { position: relative; min-height: 128px; border-radius: var(--r-sm); overflow: hidden; background: #eef1f3; }
   .video-cover img { width: 100%; height: 100%; position: absolute; inset: 0; object-fit: cover; }
-  .video-cover > span { height: 100%; display: grid; place-items: center; align-content: center; gap: 5px; color: var(--muted); font-size: 11px; }
-  .video-cover i { position: absolute; left: 10px; bottom: 9px; display: grid; place-items: center; width: 30px; height: 30px; border-radius: 50%; color: white; background: rgba(0,0,0,.68); }
-  .video-cover small { position: absolute; right: 8px; bottom: 7px; padding: 2px 5px; border-radius: 3px; color: white; background: rgba(0,0,0,.72); font-size: 10px; }
+  .video-cover > span { height: 100%; display: grid; place-items: center; align-content: center; gap: 5px; color: var(--muted-2); font-size: 11.5px; }
+  .video-cover i { position: absolute; left: 10px; bottom: 9px; display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; color: #fff; background: rgb(251 114 153 / 88%); box-shadow: 0 4px 12px -3px rgb(251 114 153 / 60%); }
+  .video-cover small { position: absolute; right: 7px; bottom: 7px; padding: 2px 7px; border-radius: 999px; color: #fff; background: rgb(24 25 28 / 62%); font-size: 11px; font-variant-numeric: tabular-nums; }
   .video-copy { min-width: 0; display: grid; align-content: center; gap: 7px; padding: 14px 16px; }
-  .video-copy strong { overflow-wrap: anywhere; line-height: 1.45; }
-  .video-copy p { display: -webkit-box; overflow: hidden; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
-  .card-badge { width: fit-content; padding: 2px 5px; border-radius: 3px; color: #a22e55; background: #ffe5ed; font-size: 10px; }
-  .video-stats { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 11px; }
-  .forward-card { display: grid; gap: 12px; padding: 14px; border-left: 3px solid #b8c0c4; background: #f4f6f7; }
-  .forward-card > header { display: flex; align-items: center; gap: 8px; }
+  .video-copy strong { overflow-wrap: anywhere; line-height: 1.5; font-size: 14px; font-weight: 650; }
+  .video-copy p { display: -webkit-box; overflow: hidden; margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.6; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
+  .card-badge { width: fit-content; padding: 2px 9px; border-radius: 999px; color: var(--blue); background: var(--blue-tint); font-size: 11px; font-weight: 620; }
+  .video-stats { display: flex; align-items: center; gap: 6px; color: var(--muted-2); font-size: 12px; }
+  .forward-card { display: grid; gap: 12px; padding: 13px 15px; border: 1px solid var(--line-soft); border-radius: var(--r); background: #f7f8fa; }
+  .forward-card > header { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12.5px; }
   .forward-card > header img { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; }
-  .forward-card > header strong { min-width: 0; overflow-wrap: anywhere; font-size: 13px; }
-  .forward-card > header a { margin-left: auto; color: var(--blue); font-size: 11px; }
-  .forward-card > p { margin: 0; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .forward-unavailable { color: var(--muted); }
+  .forward-card > header strong { min-width: 0; overflow-wrap: anywhere; color: var(--blue); font-size: 13px; font-weight: 650; }
+  .forward-card > header a { margin-left: auto; color: var(--blue); font-size: 11.5px; }
+  .forward-card > p { margin: 0; color: var(--muted); line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13.5px; }
+  .forward-unavailable { color: var(--muted-2); }
   .media-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
   .compact .media-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .media-grid a { min-width: 0; }
-  .media-grid img, .media-missing { width: 100%; min-height: 150px; max-height: 520px; object-fit: contain; border-radius: 4px; background: #edf0f1; }
+  .media-grid img, .media-missing { width: 100%; min-height: 150px; max-height: 520px; object-fit: contain; border-radius: var(--r-sm); background: #f4f5f7; }
   .compact .media-grid img, .compact .media-missing { min-height: 0; aspect-ratio: 1; object-fit: cover; }
   .card-media img, .card-media .media-missing { min-height: 110px; max-height: 360px; }
-  .media-missing { display: grid; place-items: center; align-content: center; gap: 5px; color: var(--muted); font-size: 11px; }
-  .nested { grid-template-columns: minmax(150px, 34%) 1fr; background: white; }
+  .media-missing { display: grid; place-items: center; align-content: center; gap: 6px; border: 1px dashed #dfe3e6; color: var(--muted-2); font-size: 11.5px; }
+  .nested { grid-template-columns: minmax(150px, 34%) 1fr; background: #fff; }
   @media (max-width: 560px) {
     .video-card, .nested { grid-template-columns: 1fr; }
     .video-cover { min-height: 170px; }
