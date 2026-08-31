@@ -24,6 +24,23 @@ upsertDynamic({ ...aliasBase, text: '别名第二版', mediaUrls: [`${aliasImage
 aliasMedia = getDb().prepare('SELECT media_id FROM dynamic_media WHERE dynamic_id=?').get(aliasBase.id) as { media_id: string };
 await downloadMediaAsset(aliasMedia.media_id);
 upsertDynamic({ ...aliasBase, text: '别名第三版', mediaUrls: [] });
+const onePixel = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
+upsertDynamic({ id: 'e2e-video-card', streamerId, type: 'DYNAMIC_TYPE_AV', text: '',
+  sourceUrl: 'https://www.bilibili.com/opus/e2e-video-card', publishedAt: new Date(baseTime + 120_000).toISOString(),
+  mediaUrls: [onePixel], rawExcerpt: JSON.stringify({ card: { kind: 'video', title: '投稿视频完整卡片', description: '合作投稿简介',
+    url: 'https://www.bilibili.com/video/BV1e2e', coverUrl: onePixel, durationText: '03:48', badge: '合作视频',
+    viewCount: '2.2万', danmakuCount: '16' } }) });
+let cardMedia = getDb().prepare('SELECT media_id FROM dynamic_media WHERE dynamic_id=?').get('e2e-video-card') as { media_id: string };
+await downloadMediaAsset(cardMedia.media_id);
+const bilibiliEmoji = 'https://i0.hdslb.com/bfs/garb/8968722a8a28574b90980790383526db201b20e5.png';
+upsertDynamic({ id: 'e2e-forward-card', streamerId, type: 'DYNAMIC_TYPE_FORWARD', text: '外层正文[外层表情]',
+  sourceUrl: 'https://www.bilibili.com/opus/e2e-forward-card', publishedAt: new Date(baseTime + 180_000).toISOString(),
+  emojiMap: { '[外层表情]': bilibiliEmoji }, mediaUrls: [onePixel], rawExcerpt: JSON.stringify({ card: { kind: 'forward', authorName: '原动态作者',
+    authorUid: '10086', authorAvatarUrl: null, text: '原动态正文[原文表情]', emojiMap: { '[原文表情]': bilibiliEmoji },
+    sourceUrl: 'https://www.bilibili.com/opus/e2e-original', originalType: 'DYNAMIC_TYPE_DRAW', mediaUrls: [onePixel],
+    video: null, unavailable: false } }) });
+cardMedia = getDb().prepare('SELECT media_id FROM dynamic_media WHERE dynamic_id=?').get('e2e-forward-card') as { media_id: string };
+await downloadMediaAsset(cardMedia.media_id);
 const draftId = createManualScheduleDraft('e2e-dynamic-00');
 updateScheduleDraftEntries(draftId, [{ occurrenceDate: null, weekday: 3, localTime: '20:00', status: 'scheduled',
   title: '端到端直播', confidence: 95, sourceText: '周三 20:00 端到端直播' }]);

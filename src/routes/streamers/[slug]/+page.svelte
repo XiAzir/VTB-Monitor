@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { ArrowLeft, CalendarDays, Clock3, ExternalLink, MessageSquare, Radio, RefreshCw, History, Image as ImageIcon, Search } from '@lucide/svelte';
-  import { confidenceClass, formatDateTime, relativeTime, sourceLabel, richTextHtml } from '$lib/format';
+  import { ArrowLeft, CalendarDays, Clock3, ExternalLink, MessageSquare, Radio, RefreshCw, History, Search } from '@lucide/svelte';
+  import { confidenceClass, formatDateTime, relativeTime, sourceLabel } from '$lib/format';
   import { proxyBilibiliImage } from '$lib/image';
+  import DynamicContent from '$lib/components/DynamicContent.svelte';
   let { data } = $props();
   const weekdays = ['', '周一', '周二', '周三', '周四', '周五', '周六', '周日'];
   const liveStatusLabel = (status: string) => status === 'live' ? '正在直播' : status === 'rotating' ? '轮播中' : status === 'offline' ? '未开播' : '状态未知';
@@ -64,18 +65,11 @@
             <article class="dynamic panel">
               <div class="dynamic-meta">
                 <time>{formatDateTime(dynamic.publishedAt)}</time>
+                {#if dynamic.isPinned}<span class="badge medium">置顶</span>{/if}
                 {#if dynamic.state !== 'visible'}<span class="badge low">{dynamic.state === 'deleted' ? '源内容已删除' : dynamic.state === 'suspected_deleted' ? '疑似已删除' : '暂时不可见'}</span>{/if}
                 <span>{relativeTime(dynamic.updatedAt)}同步</span>
               </div>
-              {#if dynamic.text}<p class="rich-text">{@html richTextHtml(dynamic.text, dynamic.emojiMap)}</p>{:else}<p>此动态没有文字正文。</p>{/if}
-              {#if dynamic.media.length > 0}
-                <div class="media-strip">
-                  {#each dynamic.media.slice(0, 4) as media}
-                    {#if media.localUrl}<img src={media.localUrl} alt="动态图片" loading="lazy" />
-                    {:else}<span class="media-missing"><ImageIcon size={18} /> {media.state === 'failed' ? '图片下载失败' : media.state === 'quota_exceeded' ? '媒体配额已满' : '图片待下载'}</span>{/if}
-                  {/each}
-                </div>
-              {/if}
+              <DynamicContent text={dynamic.text} emojiMap={dynamic.emojiMap} card={dynamic.card} media={dynamic.media} compact />
               <footer>
                 <span><MessageSquare size={15} /> {dynamic.commentCount} 条评论</span>
                 <a href={`/dynamics/${dynamic.id}`}>查看动态与评论 <ExternalLink size={14} /></a>
@@ -151,11 +145,6 @@
   .source-performance span { color: var(--muted); font-size: 11px; line-height: 1.5; }
   .dynamic { padding: 17px; }
   .dynamic-meta { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
-  .dynamic p { margin: 14px 0; line-height: 1.72; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .rich-text :global(.inline-emoji) { width: 1.6em; height: 1.6em; vertical-align: -0.35em; object-fit: contain; }
-  .media-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 12px 0; }
-  .media-strip img, .media-missing { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 4px; background: #edf0f1; }
-  .media-missing { display: grid; place-items: center; color: var(--muted); font-size: 11px; }
   .dynamic footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; border-top: 1px solid var(--line); padding-top: 12px; color: var(--muted); font-size: 12px; }
   .dynamic footer span, .dynamic footer a { display: inline-flex; align-items: center; gap: 5px; }
   .dynamic footer a { color: var(--blue); }
@@ -171,5 +160,5 @@
   .sessions span { color: var(--muted); font-size: 12px; }
   .empty.small { padding: 24px 12px; }
   @media (max-width: 850px) { .detail-grid { grid-template-columns: 1fr; } .status-band { grid-template-columns: 1fr; } .status-band > div { border-right: 0; border-bottom: 1px solid #303438; } }
-  @media (max-width: 520px) { .streamer-header { grid-template-columns: auto 1fr; } .streamer-header .button { grid-column: 1 / -1; } .media-strip { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 520px) { .streamer-header { grid-template-columns: auto 1fr; } .streamer-header .button { grid-column: 1 / -1; } }
 </style>

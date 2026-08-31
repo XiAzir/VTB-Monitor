@@ -3,6 +3,23 @@
   import PiChat from '$lib/components/PiChat.svelte';
   import { formatDateTime, relativeTime } from '$lib/format';
   let { data, form } = $props();
+  const jobLabels: Record<string, string> = {
+    sync_streamer: '同步主播动态', refresh_dynamic: '刷新动态', sync_comments: '同步评论', sync_sub_replies: '同步楼中楼',
+    download_media: '下载媒体', pi_analyze: 'Pi 预测分析', pi_revision: 'Pi 编辑分析', recognize_schedule: '识别周表',
+    repair_dynamic_archives: '修复动态归档', cleanup_storage: '清理存储', validate_cookie: '验证 Cookie', send_alert_email: '发送告警邮件'
+  };
+  const statusLabels: Record<string, string> = { pending: '等待中', retry: '待重试', running: '执行中', done: '已完成', failed: '失败' };
+  const auditLabels: Record<string, string> = {
+    'alert.acknowledge': '确认告警', 'alert.acknowledge_all': '批量确认告警', 'alert.resolve': '解决告警',
+    'forecast.set': '设置预测', 'schedule.replace': '替换周表', 'schedule.manual.replace': '替换人工周表',
+    'schedule.exception.upsert': '更新周表安排', 'streamer.create': '添加主播', 'streamer.update': '更新主播配置',
+    'secret.put': '更新密钥', 'setting.update': '更新设置'
+  };
+  const actorLabels: Record<string, string> = { admin: '管理员', 'admin-ui': '后台', pi: 'Pi', system: '系统', scheduler: '调度器' };
+  function jobLabel(type: unknown): string { return jobLabels[String(type)] ?? `任务：${String(type)}`; }
+  function statusLabel(status: unknown): string { return statusLabels[String(status)] ?? String(status); }
+  function auditLabel(action: unknown): string { return auditLabels[String(action)] ?? String(action).replaceAll('.', ' · '); }
+  function actorLabel(actor: unknown): string { return actorLabels[String(actor)] ?? String(actor); }
 </script>
 
 <svelte:head><title>后台管理 · 监控室老大爷</title></svelte:head>
@@ -111,12 +128,20 @@
             <form class="panel form-panel" method="POST" action="?/saveCookie"><div class="form-title"><Radio size={17} /><strong>B站 Cookie</strong></div>
               <p class="form-help">失效时自动回退匿名抓取并发送告警。</p><div class="field"><label for="cookie">替换 Cookie</label><textarea id="cookie" name="cookie" autocomplete="off" required></textarea></div>
               <button class="button" type="submit">加密保存并验证</button></form>
+            <form class="panel form-panel" method="POST" action="?/saveBilibiliProxy"><div class="form-title"><ServerCog size={17} /><strong>B站请求代理</strong></div>
+              <p class="form-help">仅用于 B站 API、动态详情和直播状态请求；留空使用直连。</p>
+              <div class="field"><label for="bilibili-proxy">HTTP(S) 代理 URL</label><input id="bilibili-proxy" name="proxyUrl" value={data.bilibiliProxyUrl || ''} placeholder="http://127.0.0.1:7890" /></div>
+              <button class="button" type="submit">保存并验证</button></form>
             <form class="panel form-panel" method="POST" action="?/savePi"><div class="form-title"><Bot size={17} /><strong>Pi Provider</strong><span class={`badge ${data.pi.configured ? 'high' : 'low'}`}>{data.pi.configured ? '已配置' : '未配置'}</span></div>
               <div class="field"><label for="provider">Provider</label><select id="provider" name="provider" value={data.pi.profile.provider}><option value="openai">OpenAI Responses</option><option value="anthropic">Anthropic Messages</option><option value="google">Google Generative AI</option><option value="openrouter">OpenAI Chat / OpenRouter</option></select></div>
               <div class="field"><label for="modelId">模型 ID</label><input id="modelId" name="modelId" value={data.pi.profile.modelId} required /></div>
               <div class="field"><label for="baseUrl">自定义 Base URL</label><input id="baseUrl" name="baseUrl" value={data.pi.profile.baseUrl || ''} placeholder="可留空" /></div>
               <div class="field"><label for="apiKey">替换 API Key</label><input id="apiKey" name="apiKey" type="password" autocomplete="new-password" placeholder="不修改可留空" /></div>
               <div class="field"><label for="thinkingLevel">思考强度</label><select id="thinkingLevel" name="thinkingLevel" value={data.pi.profile.thinkingLevel}><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select></div>
+              <label class="checkbox"><input name="supportsImage" type="checkbox" checked={data.pi.profile.input?.includes('image') || false} /> 支持图片输入</label>
+              <label class="checkbox"><input name="reasoning" type="checkbox" checked={data.pi.profile.reasoning || false} /> 启用模型推理</label>
+              <label class="checkbox"><input name="sessionAffinity" type="checkbox" checked={data.pi.profile.sessionAffinity || false} /> 启用会话亲和</label>
+              <p class="form-help">输入：文字{data.pi.profile.input?.includes('image') ? '、图片' : ''}；输出：文字。</p>
               <button class="button" type="submit">保存 Pi 配置</button></form>
           </div>
         </section>
@@ -124,10 +149,10 @@
         <section id="alerts">
           <div class="section-title"><div><AlertTriangle size={18} /><h2>告警与任务</h2></div></div>
           <div class="split-list">
-            <div class="panel list-panel"><h3>待处理告警</h3>{#if data.alerts.length === 0}<div class="empty small">当前没有告警</div>{/if}
+            <div class="panel list-panel"><div class="list-heading"><h3>待处理告警</h3>{#if data.alerts.length > 0}<form method="POST" action="?/acknowledgeAll" onsubmit={(event) => { if (!confirm(`确定确认全部 ${data.alerts.length} 条待处理告警吗？`)) event.preventDefault(); }}><button class="button" type="submit">一键确认</button></form>{/if}</div>{#if data.alerts.length === 0}<div class="empty small">当前没有告警</div>{/if}
               {#each data.alerts as alert}<div class="list-row"><div><strong>{String(alert.title)}</strong><small>{String(alert.message)} · {relativeTime(String(alert.last_seen_at))}</small></div>
                 <form method="POST" action="?/acknowledge"><input type="hidden" name="alertId" value={String(alert.id)} /><button class="button" type="submit">确认</button></form></div>{/each}</div>
-            <div class="panel list-panel"><h3>最近任务</h3>{#each data.jobs.slice(0, 12) as job}<div class="list-row"><div><strong>{String(job.type)}</strong><small>{String(job.status)} · 尝试 {Number(job.attempts)} 次</small></div><time>{relativeTime(String(job.updated_at))}</time></div>{/each}</div>
+            <div class="panel list-panel"><h3>最近任务</h3>{#each data.jobs.slice(0, 12) as job}<div class="list-row"><div><strong>{jobLabel(job.type)}</strong><small>{statusLabel(job.status)} · 尝试 {Number(job.attempts)} 次</small></div><time>{relativeTime(String(job.updated_at))}</time></div>{/each}</div>
           </div>
         </section>
 
@@ -149,7 +174,7 @@
         </section>
       </div>
 
-      <aside><PiChat /><div class="panel audit"><h3>最近审计</h3>{#each data.audit.slice(0, 12) as entry}<div><strong>{String(entry.action)}</strong><small>{String(entry.actor_type)} · {relativeTime(String(entry.created_at))}</small></div>{/each}</div></aside>
+      <aside><PiChat /><div class="panel audit"><h3>最近审计</h3>{#each data.audit.slice(0, 12) as entry}<div><strong>{auditLabel(entry.action)}</strong><small>{actorLabel(entry.actor_type)} · {relativeTime(String(entry.created_at))}</small></div>{/each}</div></aside>
     </div>
   </section>
 {/if}
@@ -163,14 +188,15 @@
   .token-list { display: grid; border-top: 1px solid var(--line); }.token-list > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 9px; }.token-list span { min-width: 0; }.token-list strong, .token-list small { display: block; overflow: hidden; text-overflow: ellipsis; }.token-list small { margin-top: 2px; color: var(--muted); font-size: 10px; }.token-list .button { min-height: 30px; padding: 0 9px; font-size: 11px; }
   .stats-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 28px; }
   .stat { min-height: 92px; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 3px 9px; padding: 14px; }.stat :global(svg) { grid-row: 1 / 3; color: var(--muted); }.stat strong { font-size: 22px; }.stat span { color: var(--muted); font-size: 11px; }
-  .admin-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 24px; align-items: start; }.admin-main { display: grid; gap: 32px; }.admin-grid aside { display: grid; gap: 16px; position: sticky; top: 78px; }
+  .admin-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 24px; align-items: start; }.admin-main { min-width: 0; display: grid; gap: 32px; }.admin-main > section, .admin-grid aside, .settings-grid > *, .split-list > * { min-width: 0; }.admin-grid aside { display: grid; gap: 16px; position: sticky; top: 78px; }
   .section-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }.section-title > div, .form-title { display: flex; align-items: center; gap: 8px; }.section-title h2 { margin: 0; font-size: 17px; }
   .table-wrap { overflow: auto; }table { width: 100%; border-collapse: collapse; font-size: 12px; }th,td { padding: 11px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }th { color: var(--muted); background: #f5f6f7; font-weight: 650; }td strong,td small { display: block; }td small { margin-top: 3px; color: var(--muted); }.row-actions { display: flex; gap: 5px; }.row-actions .icon-button { width: 31px; height: 31px; }
   .form-panel { display: grid; gap: 12px; padding: 15px; }.four-cols { grid-template-columns: repeat(4, 1fr) auto; align-items: end; margin-top: 10px; }.four-cols .form-title { grid-column: 1 / -1; }.four-cols .button { margin-bottom: 1px; }
   .streamer-editor { margin-top: 8px; }.streamer-editor summary { cursor: pointer; padding: 11px 13px; font-size: 12px; font-weight: 650; }.streamer-editor .form-panel { border-top: 1px solid var(--line); }.four-cols .wide { grid-column: span 2; }
   .settings-grid, .split-list { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: start; }.form-help { margin: -5px 0 0; color: var(--muted); font-size: 11px; }.checkbox { display: flex; align-items: center; gap: 7px; font-size: 12px; }
   .list-panel h3, .audit h3 { margin: 0; padding: 12px; border-bottom: 1px solid var(--line); font-size: 13px; }.list-row, .audit > div { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--line); }.list-row:last-child, .audit > div:last-child { border-bottom: 0; }.list-row > div, .audit > div { min-width: 0; }.list-row strong, .list-row small, .audit strong, .audit small { display: block; }.list-row small, .audit small, .list-row time { margin-top: 3px; color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; }.list-row .button { min-height: 30px; padding: 0 9px; font-size: 11px; }
+  .list-heading { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }.list-heading h3 { border-bottom: 0; }.list-heading form { margin-right: 10px; }.list-heading .button { min-height: 30px; padding: 0 9px; font-size: 11px; }
   .empty.small { padding: 25px 12px; }.audit { overflow: hidden; }.audit > div { display: grid; justify-content: stretch; }
-  @media (max-width: 1050px) { .admin-grid { grid-template-columns: 1fr; }.admin-grid aside { position: static; }.stats-grid { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 1050px) { .admin-grid { grid-template-columns: minmax(0, 1fr); }.admin-grid aside { position: static; }.stats-grid { grid-template-columns: repeat(3, 1fr); } }
   @media (max-width: 760px) { .four-cols, .settings-grid, .split-list { grid-template-columns: 1fr; }.four-cols .form-title, .four-cols .wide { grid-column: 1; }.stats-grid { grid-template-columns: repeat(2, 1fr); } }
 </style>

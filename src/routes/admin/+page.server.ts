@@ -2,11 +2,12 @@ import { error, fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { getPiStatus } from '$lib/server/pi';
 import {
-  acknowledgeAlert, changeAdminPassword, createAdminSession, createApiToken, createStreamer, deleteAdminSession, enqueueJob,
+  acknowledgeAlert, acknowledgeAllAlerts, changeAdminPassword, createAdminSession, createApiToken, createStreamer, deleteAdminSession, enqueueJob,
   findAdminByUsername, getDashboardStats, getSetting, listAdminStreamers, listAlerts, listApiTokens,
-  listAudit, listJobs, listSecretMetadata, putSecret, replaceManualScheduleRules, revokeApiToken, setForecast, setSetting, updateStreamer
+  listAudit, listJobs, listSecretMetadata, putSecret, queuePiManualAnalysis, replaceManualScheduleRules, revokeApiToken, setForecast, setSetting, updateStreamer
 } from '$lib/server/store';
 import { verifyPassword } from '$lib/server/security';
+import type { PiProfile } from '$lib/server/pi';
 
 interface SmtpSettings {
   host: string;
@@ -30,6 +31,7 @@ export const load: PageServerLoad = ({ locals }) => {
     secrets: listSecretMetadata(),
     tokens: listApiTokens(),
     pi: getPiStatus(),
+    bilibiliProxyUrl: getSetting<string>('bilibili_proxy_url', ''),
     smtp: getSetting<SmtpSettings | null>('smtp', null)
   };
 };
@@ -111,8 +113,6 @@ export const actions: Actions = {
         return { weekday: Number(match[1]), localTime: match[2], title: match[3] };
       });
       replaceManualScheduleRules(String(form.get('streamerId')), rules, `admin:${locals.adminSession!.adminId}`);
-      enqueueJob('pi_analyze', String(form.get('streamerId')), { reason: 'manual_schedule_changed' }, 10,
-        new Date().toISOString(), `manual-schedule:${form.get('streamerId')}:${Date.now()}`);
       return { saved: rules.length ? '人工周表已保存并锁定' : '人工周表已清空' };
     } catch (error) { return fail(400, { formError: formatError(error) }); }
   },
@@ -125,14 +125,29 @@ export const actions: Actions = {
     enqueueJob('validate_cookie', null, {}, 1, new Date().toISOString(), `validate-cookie:${Date.now()}`);
     return { saved: 'B站 Cookie 已加密保存' };
   },
+  saveBilibiliProxy: async ({ request, locals }) => {
+    requireAdmin(locals.adminSession);
+    const form = await request.formData();
+    const value = String(form.get('proxyUrl') ?? '').trim();
+    if (value) {
+      let parsed: URL;
+      try { parsed = new URL(value); } catch { return fail(400, { formError: 'B站代理 URL 格式无效' }); }
+      if (!['http:', 'https:'].includes(parsed.protocol)) return fail(400, { formError: 'B站代理仅支持 HTTP 或 HTTPS' });
+    }
+    setSetting('bilibili_proxy_url', value || null, `admin:${locals.adminSession!.adminId}`);
+    enqueueJob('validate_cookie', null, {}, 1, new Date().toISOString(), `validate-cookie:proxy:${Date.now()}`);
+    return { saved: value ? 'B站代理已保存并开始验证' : 'B站代理已清空' };
+  },
   savePi: async ({ request, locals }) => {
     requireAdmin(locals.adminSession);
     const form = await request.formData();
     const provider = String(form.get('provider') ?? 'openai');
     const modelId = String(form.get('modelId') ?? '').trim();
     if (!modelId) return fail(400, { formError: '模型 ID 不能为空' });
+    const input: PiProfile['input'] = form.get('supportsImage') === 'on' ? ['text', 'image'] : ['text'];
     setSetting('pi_profile', { provider, modelId, baseUrl: String(form.get('baseUrl') ?? '').trim() || undefined,
-      apiKeySecret: 'pi_api_key', thinkingLevel: String(form.get('thinkingLevel') ?? 'low') }, `admin:${locals.adminSession!.adminId}`);
+      apiKeySecret: 'pi_api_key', thinkingLevel: String(form.get('thinkingLevel') ?? 'low'), input, output: ['text'],
+      reasoning: form.get('reasoning') === 'on', sessionAffinity: form.get('sessionAffinity') === 'on' }, `admin:${locals.adminSession!.adminId}`);
     const apiKey = String(form.get('apiKey') ?? '').trim();
     if (apiKey) putSecret('pi_api_key', apiKey, `admin:${locals.adminSession!.adminId}`);
     return { saved: 'Pi 配置已保存' };
@@ -167,9 +182,9 @@ export const actions: Actions = {
     const form = await request.formData();
     const streamerId = String(form.get('streamerId') ?? '');
     const operation = String(form.get('operation') ?? 'sync');
-    enqueueJob(operation === 'refresh' ? 'sync_streamer' : operation === 'sync' ? 'sync_streamer' : 'pi_analyze', streamerId,
-      operation === 'refresh' ? { fullSync: true } : { operation }, 5,
-      new Date().toISOString(), `admin:${operation}:${streamerId}:${Date.now()}`);
+    if (operation === 'refresh' || operation === 'sync') enqueueJob('sync_streamer', streamerId,
+      operation === 'refresh' ? { fullSync: true } : {}, 5, new Date().toISOString(), `admin:${operation}:${streamerId}:${Date.now()}`);
+    else queuePiManualAnalysis(streamerId, operation);
     return { saved: '任务已加入队列' };
   },
   acknowledge: async ({ request, locals }) => {
@@ -177,6 +192,11 @@ export const actions: Actions = {
     const form = await request.formData();
     acknowledgeAlert(String(form.get('alertId')), `admin:${locals.adminSession!.adminId}`);
     return { saved: '告警已确认' };
+  }
+  ,acknowledgeAll: async ({ locals }) => {
+    requireAdmin(locals.adminSession);
+    const count = acknowledgeAllAlerts(`admin:${locals.adminSession!.adminId}`);
+    return { saved: count ? `已确认 ${count} 条告警` : '当前没有待处理告警' };
   }
 };
 

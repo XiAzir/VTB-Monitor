@@ -12,7 +12,11 @@ export const POST = async ({ request, locals }) => {
     start(controller) {
       void runAdminPiPrompt(prompt, (delta) => controller.enqueue(encoder.encode(delta)))
         .then(() => controller.close())
-        .catch((reason) => controller.error(reason));
+        .catch((reason) => {
+          const message = reason instanceof Error ? reason.message : String(reason);
+          controller.enqueue(encoder.encode(`\n[Pi 错误] ${message}`));
+          controller.close();
+        });
     }
   });
   return new Response(stream, { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } });

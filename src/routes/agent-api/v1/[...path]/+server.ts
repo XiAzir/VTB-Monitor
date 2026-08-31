@@ -2,7 +2,8 @@ import { error, json, type RequestHandler } from '@sveltejs/kit';
 import { getDb } from '$lib/server/db';
 import {
   acknowledgeAlert, authenticateApiToken, createStreamer, enqueueJob, getDashboardStats, getSecret,
-  listAdminStreamers, listAlerts, listAudit, listDynamicRevisions, listDynamics, listJobs, listSecretMetadata, putSecret, updateStreamer
+  listAdminStreamers, listAlerts, listAudit, listDynamicRevisions, listDynamics, listJobs, listSecretMetadata, putSecret,
+  queuePiManualAnalysis, updateStreamer
 } from '$lib/server/store';
 
 type Token = NonNullable<ReturnType<typeof authenticateApiToken>>;
@@ -59,9 +60,10 @@ async function dispatch(event: Parameters<RequestHandler>[0], method: string): P
   if (method === 'POST' && operation) {
     requireScope(token, 'ops:run');
     return idempotent(event.request, token, path, async () => {
-      const jobId = enqueueJob(operation[2] === 'sync' || operation[2] === 'refresh' ? 'sync_streamer' : 'pi_analyze', operation[1],
-        operation[2] === 'refresh' ? { fullSync: true } : { operation: operation[2] },
-        5, new Date().toISOString(), `api:${event.request.headers.get('idempotency-key')}`);
+      const jobId = operation[2] === 'sync' || operation[2] === 'refresh'
+        ? enqueueJob('sync_streamer', operation[1], operation[2] === 'refresh' ? { fullSync: true } : {}, 5,
+          new Date().toISOString(), `api:${event.request.headers.get('idempotency-key')}`)
+        : queuePiManualAnalysis(operation[1], operation[2]);
       return { status: 202, body: { jobId } };
     });
   }

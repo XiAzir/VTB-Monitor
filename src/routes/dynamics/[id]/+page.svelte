@@ -1,11 +1,13 @@
 <script lang="ts">
-  import { ArrowLeft, ExternalLink, Heart, MessageSquare, Pin, RefreshCw, UserRoundCheck, Image as ImageIcon } from '@lucide/svelte';
-  import { formatDateTime, richTextHtml } from '$lib/format';
+  import { ArrowLeft, ExternalLink, Heart, MessageSquare, Pin, RefreshCw, UserRoundCheck } from '@lucide/svelte';
+  import { formatDateTime } from '$lib/format';
   import { proxyBilibiliImage } from '$lib/image';
+  import DynamicContent from '$lib/components/DynamicContent.svelte';
   let { data } = $props();
   const displayText = $derived(data.selectedRevision ? String(data.selectedRevision.snapshot.text ?? data.selectedRevision.text) : data.dynamic.text);
   const displayMedia = $derived(data.selectedRevision ? data.selectedRevision.media : data.dynamic.media);
   const displayEmojiMap = $derived(data.selectedRevision ? data.selectedRevision.emojiMap : data.dynamic.emojiMap);
+  const displayCard = $derived(data.selectedRevision ? data.selectedRevision.card : data.dynamic.card);
 </script>
 
 <svelte:head><title>动态详情 · {String(data.streamer.name)}</title></svelte:head>
@@ -19,15 +21,7 @@
     </header>
     {#if data.dynamic.state === 'deleted'}<div class="source-warning">最新版已被删除，当前显示删除前最后一版内容。</div>{:else if data.dynamic.state !== 'visible'}<div class="source-warning">源动态不可见，本页展示的是本地归档。</div>{/if}
     {#if data.selectedRevision}<div class="revision-note">正在查看历史版本 · {formatDateTime(data.selectedRevision.createdAt)} <a href={`/dynamics/${data.dynamic.id}`}>查看当前版</a></div>{/if}
-    {#if displayText}<p class="rich-text">{@html richTextHtml(displayText, displayEmojiMap)}</p>{:else}<p>此动态没有文字正文。</p>{/if}
-    {#if displayMedia.length > 0}
-      <div class="media-grid">
-        {#each displayMedia as media}
-          {#if media.localUrl}<a href={media.localUrl} target="_blank"><img src={media.localUrl} alt="动态原图" loading="lazy" /></a>
-          {:else}<div class="media-missing"><ImageIcon size={24} /><span>{media.state === 'failed' ? '原图下载失败' : media.state === 'quota_exceeded' ? '媒体配额已满' : '原图待下载'}</span></div>{/if}
-        {/each}
-      </div>
-    {/if}
+    <DynamicContent text={displayText} emojiMap={displayEmojiMap} card={displayCard} media={displayMedia} />
     <footer><span><Heart size={15} /> {data.dynamic.likeCount}</span><span><MessageSquare size={15} /> {data.dynamic.commentCount}</span></footer>
   </article>
   <div class="dynamic-actions">{#if data.canRefresh}<form method="POST" action="?/markSchedule"><button class="button" type="submit">作为周表识别</button></form><form method="POST" action="?/refresh"><button class="button" type="submit"><RefreshCw size={15} /> 刷新此动态</button></form>{:else}<a class="button" href="/admin"><RefreshCw size={15} /> 登录后刷新</a>{/if}</div>
@@ -69,8 +63,6 @@
   .dynamic-detail header { display: flex; align-items: center; justify-content: space-between; }
   .dynamic-detail header > div { display: grid; gap: 4px; }
   .dynamic-detail time { color: var(--muted); font-size: 12px; }
-  .dynamic-detail > p { margin: 22px 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.75; }
-  .dynamic-detail > .rich-text :global(.inline-emoji) { width: 1.6em; height: 1.6em; vertical-align: -0.35em; object-fit: contain; }
   .source-warning { margin-top: 15px; padding: 9px 11px; border-left: 3px solid var(--amber); background: #fff4dc; color: #6d4c15; font-size: 12px; }
   .revision-note { margin-top: 14px; color: var(--muted); font-size: 12px; }
   .revision-note a, .revisions a { color: var(--blue); }
@@ -83,9 +75,6 @@
   .text-diff .added { background: #d9f5e4; color: #126438; }
   .text-diff .removed { background: #ffe1e1; color: #9c2626; text-decoration: line-through; }
   .change-row { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
-  .media-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
-  .media-grid img, .media-missing { width: 100%; min-height: 160px; max-height: 520px; object-fit: contain; background: #f0f2f3; border-radius: 4px; }
-  .media-missing { display: grid; place-items: center; align-content: center; gap: 7px; color: var(--muted); font-size: 12px; }
   .dynamic-detail footer { display: flex; gap: 20px; margin-top: 18px; padding-top: 13px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
   .dynamic-detail footer span, .comment-stats { display: inline-flex; align-items: center; gap: 5px; }
   .comments-heading { display: flex; align-items: baseline; justify-content: space-between; margin: 28px 0 12px; }
@@ -108,5 +97,5 @@
   .replies { display: grid; gap: 8px; margin-top: 12px; padding: 11px; background: #f3f5f6; border-radius: 4px; }
   .reply { display: grid; grid-template-columns: auto auto 1fr auto; align-items: baseline; gap: 6px; font-size: 12px; }
   .reply span { overflow-wrap: anywhere; }
-  @media (max-width: 560px) { .media-grid { grid-template-columns: 1fr; } .reply { grid-template-columns: auto auto 1fr; } .reply small { grid-column: 3; } }
+  @media (max-width: 560px) { .reply { grid-template-columns: auto auto 1fr; } .reply small { grid-column: 3; } }
 </style>

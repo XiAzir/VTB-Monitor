@@ -465,5 +465,101 @@ export const migrations = [
       CREATE UNIQUE INDEX idx_prediction_missed_session_once ON prediction_evaluations(live_session_id, outcome)
         WHERE outcome='missed';
     `
+  },
+  {
+    version: 7,
+    sql: `
+      DELETE FROM dynamics WHERE type='DYNAMIC_TYPE_LIVE_RCMD';
+    `
+  },
+  {
+    version: 8,
+    sql: `
+      DELETE FROM jobs
+      WHERE type IN ('sync_comments','sync_sub_replies','refresh_dynamic')
+        AND entity_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM dynamics WHERE dynamics.id=jobs.entity_id);
+    `
+  },
+  {
+    version: 9,
+    sql: `
+      ALTER TABLE ai_usage ADD COLUMN cache_read_tokens INTEGER;
+      ALTER TABLE ai_usage ADD COLUMN cache_write_tokens INTEGER;
+      ALTER TABLE ai_usage ADD COLUMN latency_ms INTEGER;
+      ALTER TABLE ai_usage ADD COLUMN batch_id TEXT;
+
+      ALTER TABLE pi_event_cursors ADD COLUMN baseline_completed_at TEXT;
+      ALTER TABLE pi_event_cursors ADD COLUMN last_successful_analysis_at TEXT;
+
+      CREATE TABLE pi_pending_dynamics (
+        streamer_id TEXT NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
+        dynamic_id TEXT NOT NULL REFERENCES dynamics(id) ON DELETE CASCADE,
+        detected_at TEXT NOT NULL,
+        PRIMARY KEY(streamer_id, dynamic_id)
+      );
+      CREATE INDEX idx_pi_pending_streamer_time ON pi_pending_dynamics(streamer_id, detected_at, dynamic_id);
+
+      CREATE TABLE pi_dynamic_analysis_versions (
+        dynamic_id TEXT PRIMARY KEY REFERENCES dynamics(id) ON DELETE CASCADE,
+        content_hash TEXT NOT NULL,
+        analyzed_at TEXT NOT NULL
+      );
+
+      CREATE TABLE pi_revision_analyses (
+        revision_id TEXT PRIMARY KEY REFERENCES dynamic_revisions(id) ON DELETE CASCADE,
+        dynamic_id TEXT NOT NULL REFERENCES dynamics(id) ON DELETE CASCADE,
+        model TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        result_json TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE INDEX idx_pi_revision_dynamic ON pi_revision_analyses(dynamic_id, created_at DESC);
+
+      CREATE TABLE pi_streamer_leases (
+        streamer_id TEXT PRIMARY KEY REFERENCES streamers(id) ON DELETE CASCADE,
+        lease_token TEXT NOT NULL,
+        lease_until TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE service_leases (
+        name TEXT PRIMARY KEY,
+        lease_owner TEXT NOT NULL,
+        lease_until TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      UPDATE pi_conversations SET kind='streamer_legacy_v1' WHERE kind='streamer';
+      DELETE FROM jobs WHERE type='pi_analyze';
+    `
+  },
+  {
+    version: 10,
+    sql: `
+      ALTER TABLE ai_usage ADD COLUMN trigger_reason TEXT;
+      ALTER TABLE ai_usage ADD COLUMN input_item_count INTEGER;
+      ALTER TABLE ai_usage ADD COLUMN attempt_number INTEGER;
+    `
+  },
+  {
+    version: 11,
+    sql: `
+      DELETE FROM jobs
+      WHERE entity_id IN (SELECT id FROM dynamics WHERE type='DYNAMIC_TYPE_LIVE_RCMD');
+      DELETE FROM dynamics WHERE type='DYNAMIC_TYPE_LIVE_RCMD';
+    `
+  },
+  {
+    version: 12,
+    sql: `
+      ALTER TABLE dynamics ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE dynamics ADD COLUMN last_content_change_at TEXT;
+      UPDATE dynamics SET last_content_change_at=published_at WHERE last_content_change_at IS NULL;
+      CREATE INDEX idx_dynamics_pi_baseline ON dynamics(streamer_id,state,is_pinned,published_at DESC,id DESC);
+    `
   }
 ] as const;

@@ -4,6 +4,34 @@ export type SourceState = 'visible' | 'suspected_deleted' | 'deleted' | 'unavail
 export type ForecastStatus = 'live' | 'cancelled_today' | 'exact' | 'range' | 'insufficient' | 'stale';
 export type RoomMappingStatus = 'unverified' | 'verified' | 'conflict';
 
+export interface DynamicVideoCard {
+  kind: 'video';
+  title: string;
+  description: string;
+  url: string;
+  coverUrl: string | null;
+  durationText: string | null;
+  badge: string | null;
+  viewCount: string | null;
+  danmakuCount: string | null;
+}
+
+export interface DynamicForwardCard {
+  kind: 'forward';
+  authorName: string;
+  authorUid: string | null;
+  authorAvatarUrl: string | null;
+  text: string;
+  emojiMap: Record<string, string>;
+  sourceUrl: string | null;
+  originalType: string;
+  mediaUrls: string[];
+  video: DynamicVideoCard | null;
+  unavailable: boolean;
+}
+
+export type DynamicCard = DynamicVideoCard | DynamicForwardCard;
+
 export interface StreamerSummary {
   id: string;
   slug: string;
@@ -35,10 +63,14 @@ export interface DynamicRecord {
   state: SourceState;
   publishedAt: string;
   updatedAt: string;
+  lastEditedAt: string;
+  lastEditedAtSource: 'published_fallback' | 'observed_revision';
+  isPinned: boolean;
   commentCount: number;
   likeCount: number;
   media: MediaAsset[];
   emojiMap?: Record<string, string>;
+  card: DynamicCard | null;
 }
 
 export interface MediaAsset {

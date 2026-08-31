@@ -20,7 +20,7 @@ export const load: PageServerLoad = ({ params, url, locals }) => {
   const selectedRevision = url.searchParams.get('revision');
   const selected = selectedRevision ? revisions.find((item) => item.id === selectedRevision) ?? null : null;
   const currentVersion = { id: 'current', text: dynamic.text, createdAt: dynamic.updatedAt, snapshot: { state: dynamic.state },
-    media: dynamic.media, emojiMap: dynamic.emojiMap ?? {} };
+    media: dynamic.media, emojiMap: dynamic.emojiMap ?? {}, card: dynamic.card };
   const versions = [currentVersion, ...revisions];
   const selectedIndex = selected ? versions.findIndex((item) => item.id === selected.id) : 0;
   const compareToId = url.searchParams.get('compareTo');

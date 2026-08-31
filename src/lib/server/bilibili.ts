@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
-import type { LiveStatus } from '$lib/types';
+import { request as httpsRequest } from 'node:https';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import type { DynamicCard, DynamicForwardCard, DynamicVideoCard, LiveStatus } from '$lib/types';
 import type { NormalizedCommentInput, NormalizedDynamicInput } from './store';
 
 const MIXIN_KEY_ENC_TAB = [
@@ -39,7 +41,7 @@ export class BilibiliClient {
   private mixinKey: string | null = null;
   private mixinKeyExpiresAt = 0;
 
-  constructor(private readonly cookie: string | null = null) {}
+  constructor(private readonly cookie: string | null = null, private readonly proxyUrl: string | null = null) {}
 
   async validateCookie(): Promise<{ valid: boolean; loggedIn: boolean; message: string }> {
     const data = await this.fetchJson('https://api.bilibili.com/x/web-interface/nav', {}, false);
@@ -59,13 +61,23 @@ export class BilibiliClient {
     let complete = false;
     let previousOffset = '';
     while (items.length < limit) {
+      if (offset) await delay(process.env.NODE_ENV === 'test' ? 0 : 4000 + Math.floor(Math.random() * 1000));
       const url = new URL('https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space');
       url.searchParams.set('host_mid', biliUid);
+      url.searchParams.set('timezone_offset', '-480');
+      url.searchParams.set('platform', 'web');
+      url.searchParams.set('features', 'itemOpusStyle');
       if (offset) url.searchParams.set('offset', offset);
-      const data = await this.fetchJson(url.toString(), { referer: `https://space.bilibili.com/${biliUid}/dynamic` }, false);
+      let data: JsonObject;
+      try {
+        data = await this.fetchJson(url.toString(), { referer: `https://space.bilibili.com/${biliUid}/dynamic` }, false);
+      } catch (error) {
+        if (items.length > 0) break;
+        throw error;
+      }
       if (data.code !== 0) throw new BilibiliError(String(data.message ?? '动态接口失败'), Number(data.code));
       const pageItems: JsonObject[] = Array.isArray(data.data?.items) ? data.data.items as JsonObject[] : [];
-      items.push(...pageItems);
+      items.push(...pageItems.filter(isArchivedDynamicItem));
       if (since && pageItems.length > 0 && pageItems.every((item) => dynamicPublishedAt(item) < since)) {
         complete = true;
         break;
@@ -80,17 +92,19 @@ export class BilibiliClient {
     }
     return {
       items: items.slice(0, limit).map((item) => normalizeDynamic(item, biliUid))
-        .filter((item) => !since || item.publishedAt >= since),
+        .filter((item) => !since || item.isPinned || item.publishedAt >= since),
       complete
     };
   }
 
-  async fetchDynamicDetail(dynamicId: string): Promise<Pick<NormalizedDynamicInput, 'text' | 'mediaUrls' | 'commentOid' | 'commentType' | 'emojiMap'>> {
+  async fetchDynamicDetail(dynamicId: string): Promise<Pick<NormalizedDynamicInput, 'text' | 'mediaUrls' | 'commentOid' | 'commentType' | 'emojiMap' | 'editedAt'>> {
     const response = await this.fetchResponse(`https://www.bilibili.com/opus/${dynamicId}`, {
       accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
       referer: 'https://www.bilibili.com/'
     });
-    const state = extractInitialState(await response.text());
+    const html = await response.text();
+    if (isBilibiliChallengePage(html)) throw new BilibiliError('B站详情请求触发验证码或风控，请稍后重试', 412, 412);
+    const state = extractInitialState(html);
     const detail = state.detail ?? {};
     const modules = Array.isArray(detail.modules) ? detail.modules : [];
     if (!detail.basic || modules.length === 0) throw new BilibiliError('动态已删除或不可见', 404, 404);
@@ -113,9 +127,10 @@ export class BilibiliClient {
       collectImageUrls(module?.module_top?.display?.album?.pics, mediaUrls);
     }
     const basic = detail.basic ?? {};
+    const editedAt = extractDynamicEditedAt(detail);
     return { text: paragraphs.join('\n').trim(), mediaUrls: normalizeImageUrls(mediaUrls), emojiMap,
       commentOid: basic.comment_id_str ? String(basic.comment_id_str) : null,
-      commentType: basic.comment_type != null ? String(basic.comment_type) : null };
+      commentType: basic.comment_type != null ? String(basic.comment_type) : null, editedAt };
   }
 
   async fetchDynamicCommentContext(dynamicId: string): Promise<{ oid: string; type: string }> {
@@ -123,6 +138,7 @@ export class BilibiliClient {
       referer: 'https://www.bilibili.com/'
     });
     const html = await response.text();
+    if (isBilibiliChallengePage(html)) throw new BilibiliError('B站详情请求触发验证码或风控，请稍后重试', 412, 412);
     const state = extractInitialState(html);
     const oid = state?.detail?.basic?.comment_id_str;
     const type = state?.detail?.basic?.comment_type;
@@ -178,27 +194,29 @@ export class BilibiliClient {
       target.key.length > 0 && target.roomId !== null);
     if (normalizedTargets.length === 0) return result;
 
-    const url = new URL('https://api.live.bilibili.com/xlive/web-room/v1/index/getRoomBaseInfo');
-    for (const roomId of [...new Set(normalizedTargets.map((target) => target.roomId))]) {
-      url.searchParams.append('room_ids', roomId);
+    const roomsByUid: JsonObject = {};
+    const biliUids = [...new Set(normalizedTargets.map((target) => target.biliUid).filter(Boolean))] as string[];
+    if (biliUids.length > 0) {
+      const url = new URL('https://api.live.bilibili.com/room/v1/Room/get_status_info_by_uids');
+      for (const biliUid of biliUids) url.searchParams.append('uids[]', biliUid);
+      const data = await this.fetchJson(url.toString(), { referer: 'https://live.bilibili.com/' }, false);
+      if (data.code !== 0) throw new BilibiliError(String(data.message ?? '直播状态接口失败'), Number(data.code));
+      Object.assign(roomsByUid, asJsonObject(data.data));
     }
-    for (const biliUid of [...new Set(normalizedTargets.map((target) => target.biliUid).filter(Boolean))]) {
-      url.searchParams.append('uids', biliUid!);
-    }
-    url.searchParams.set('req_biz', 'web_room_componet');
-    const data = await this.fetchJson(url.toString(), { referer: 'https://live.bilibili.com/' }, false);
-    if (data.code !== 0) throw new BilibiliError(String(data.message ?? '直播状态接口失败'), Number(data.code));
-    const roomsByRoomId = asJsonObject(data.data?.by_room_ids);
-    const roomsByUid = asJsonObject(data.data?.by_uids);
     for (const target of normalizedTargets) {
-      // UID results are preferred because room_id and short_id are aliases, not identities.
       const uidRoom = target.biliUid ? resolveUidRecord(roomsByUid, target.biliUid) : undefined;
-      const aliasRoom = resolveRoomRecord(roomsByRoomId, target.roomId);
-      const room = (uidRoom && matchesRoomAlias('', uidRoom, target.roomId) ? uidRoom : undefined)
-        ?? resolveRoomRecord(roomsByRoomId, target.roomId, target.biliUid || undefined);
+      let room = uidRoom && matchesRoomAlias('', uidRoom, target.roomId) ? uidRoom : undefined;
+      let conflictUid: string | null = null;
       if (!room) {
-        const conflictUid = aliasRoom?.uid && target.biliUid && normalizeNumericId(aliasRoom.uid) !== target.biliUid
-          ? String(aliasRoom.uid) : null;
+        const initUrl = new URL('https://api.live.bilibili.com/room/v1/Room/room_init');
+        initUrl.searchParams.set('id', target.roomId);
+        const init = await this.fetchJson(initUrl.toString(), { referer: `https://live.bilibili.com/${target.roomId}` }, false);
+        const candidate = init.code === 0 ? asJsonObject(init.data) : {};
+        const candidateUid = normalizeNumericId(candidate.uid);
+        if (candidate.room_id && (!target.biliUid || candidateUid === target.biliUid)) room = candidate;
+        else if (candidateUid && target.biliUid && candidateUid !== target.biliUid) conflictUid = candidateUid;
+      }
+      if (!room) {
         result.set(target.key, { status: 'unknown', title: null, uid: conflictUid, resolvedRoomId: null, shortRoomId: null });
         continue;
       }
@@ -257,10 +275,69 @@ export class BilibiliClient {
       ...extraHeaders
     };
     if (this.cookie) headers.cookie = this.cookie;
-    const response = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) });
+    const response = this.proxyUrl
+      ? await fetchThroughProxy(url, headers, this.proxyUrl)
+      : await fetch(url, { headers, signal: AbortSignal.timeout(20_000) });
     if (!response.ok) throw new BilibiliError(`B站 HTTP ${response.status}`, response.status, response.status);
     return response;
   }
+}
+
+function isBilibiliChallengePage(html: string): boolean {
+  const sample = html.slice(0, 12000).toLowerCase();
+  return sample.includes('<title>验证码_哔哩哔哩</title>') || sample.includes('window._biligreyresult')
+    || sample.includes('请先完成验证') || sample.includes('安全验证');
+}
+
+async function fetchThroughProxy(url: string, headers: Record<string, string>, proxyUrl: string, redirectsRemaining = 5): Promise<Response> {
+  let proxy: URL;
+  try { proxy = new URL(proxyUrl); } catch { throw new BilibiliError('B站代理 URL 格式无效'); }
+  if (!['http:', 'https:'].includes(proxy.protocol)) throw new BilibiliError('B站代理仅支持 HTTP 或 HTTPS');
+  const agent = new HttpsProxyAgent(proxy);
+  return new Promise<Response>((resolve, reject) => {
+    const request = httpsRequest(url, { agent, headers: { ...headers, 'accept-encoding': 'identity' },
+      signal: AbortSignal.timeout(20_000) }, (response) => {
+      const status = response.statusCode ?? 500;
+      const location = response.headers.location;
+      if ([301, 302, 303, 307, 308].includes(status) && location && redirectsRemaining > 0) {
+        const destination = new URL(location, url);
+        if (destination.protocol !== 'https:' || !isBilibiliHost(destination.hostname)) {
+          response.resume();
+          reject(new BilibiliError('B站返回了不受信任的重定向地址', status, status));
+          return;
+        }
+        response.resume();
+        resolve(fetchThroughProxy(destination.toString(), headers, proxyUrl, redirectsRemaining - 1));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+      response.on('end', () => resolve(new Response(Buffer.concat(chunks), {
+        status,
+        statusText: response.statusMessage,
+        headers: Object.entries(response.headers).flatMap(([name, value]) =>
+          Array.isArray(value) ? value.map((entry) => [name, entry] as [string, string])
+            : value == null ? [] : [[name, String(value)] as [string, string]])
+      })));
+    });
+    request.on('error', reject);
+    request.end();
+  });
+}
+
+function isBilibiliHost(hostname: string): boolean {
+  const normalized = hostname.toLowerCase();
+  return normalized === 'bilibili.com' || normalized.endsWith('.bilibili.com');
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+/** Bilibili injects ephemeral live recommendations into space feeds as if they were dynamics. */
+export function isArchivedDynamicItem(item: JsonObject): boolean {
+  return String(item.type ?? '') !== 'DYNAMIC_TYPE_LIVE_RCMD' &&
+    String(item.modules?.module_dynamic?.major?.type ?? '') !== 'MAJOR_TYPE_LIVE_RCMD';
 }
 
 export function extractInitialState(html: string): JsonObject {
@@ -287,17 +364,37 @@ export function extractInitialState(html: string): JsonObject {
   throw new BilibiliError('动态页初始状态不完整');
 }
 
+export function extractDynamicEditedAt(detail: JsonObject): string | null {
+  const modules = Array.isArray(detail.modules) ? detail.modules as JsonObject[] : [];
+  const author = modules.map((module) => module?.module_author).find((value) => value && typeof value === 'object') as JsonObject | undefined;
+  const label = String(author?.pub_time ?? '').trim();
+  const match = label.match(/^编辑于\s*(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const [, year, month, day, hour, minute] = match;
+  const value = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${hour.padStart(2, '0')}:${minute}:00+08:00`;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
 export function normalizeDynamic(item: JsonObject, streamerId: string): NormalizedDynamicInput {
   const id = String(item.id_str ?? item.id ?? '');
   const modules = item.modules ?? {};
   const dynamic = modules.module_dynamic ?? {};
   const major = dynamic.major ?? {};
-  const desc = dynamic.desc?.text ?? item.orig?.modules?.module_dynamic?.desc?.text ?? '';
+  const summary = major.opus?.summary;
+  const description = dynamic.desc ?? summary ?? {};
+  const desc = dynamic.desc?.text ?? summary?.text ?? '';
   const mediaUrls: string[] = [];
+  const emojiMap = extractEmojiMap(description);
   if (Array.isArray(major.draw?.items)) mediaUrls.push(...major.draw.items.map((entry: JsonObject) => entry.src).filter(Boolean));
   if (major.archive?.cover) mediaUrls.push(major.archive.cover);
   if (major.article?.covers) mediaUrls.push(...major.article.covers);
   if (major.opus?.pics) mediaUrls.push(...major.opus.pics.map((entry: JsonObject) => entry.url).filter(Boolean));
+  const card = normalizeDynamicCard(item, major);
+  if (card?.kind === 'forward') {
+    mediaUrls.push(...card.mediaUrls);
+    if (card.video?.coverUrl) mediaUrls.push(card.video.coverUrl);
+  }
   const publishedTs = Number(modules.module_author?.pub_ts ?? item.pub_ts ?? 0);
   const rawAvatarUrl = modules.module_author?.face ? String(modules.module_author.face) : null;
   return {
@@ -312,9 +409,102 @@ export function normalizeDynamic(item: JsonObject, streamerId: string): Normaliz
     commentCount: Number(modules.module_stat?.comment?.count ?? 0),
     likeCount: Number(modules.module_stat?.like?.count ?? 0),
     mediaUrls: normalizeImageUrls(mediaUrls.map(String)),
-    rawExcerpt: JSON.stringify({ author: { mid: modules.module_author?.mid, name: modules.module_author?.name }, majorType: major.type }),
-    avatarUrl: rawAvatarUrl ? normalizeImageUrl(rawAvatarUrl) : null
+    emojiMap,
+    rawExcerpt: JSON.stringify({ author: { mid: modules.module_author?.mid, name: modules.module_author?.name }, majorType: major.type, card }),
+    avatarUrl: rawAvatarUrl ? normalizeImageUrl(rawAvatarUrl) : null,
+    isPinned: isPinnedDynamicItem(item),
+    detailRequired: Boolean(summary?.has_more)
   };
+}
+
+export function isPinnedDynamicItem(item: JsonObject): boolean {
+  const tag = String(item.modules?.module_tag?.text ?? '').trim();
+  return tag === '置顶' || Boolean(item.modules?.module_author?.is_top);
+}
+
+function normalizeDynamicCard(item: JsonObject, major: JsonObject): DynamicCard | null {
+  const outerType = String(item.type ?? '');
+  if (outerType === 'DYNAMIC_TYPE_FORWARD') return normalizeForwardCard(item.orig);
+  return normalizeVideoCard(major.archive);
+}
+
+function normalizeForwardCard(orig: JsonObject | null | undefined): DynamicForwardCard {
+  if (!orig || typeof orig !== 'object' || orig.type === 'DYNAMIC_TYPE_NONE') {
+    return { kind: 'forward', authorName: '原动态', authorUid: null, authorAvatarUrl: null, text: '', emojiMap: {}, sourceUrl: null,
+      originalType: String(orig?.type ?? 'DYNAMIC_TYPE_NONE'), mediaUrls: [], video: null, unavailable: true };
+  }
+  const modules = orig.modules ?? {};
+  const dynamic = modules.module_dynamic ?? {};
+  const major = dynamic.major ?? {};
+  const summary = major.opus?.summary;
+  const description = dynamic.desc ?? summary ?? {};
+  const author = modules.module_author ?? {};
+  const origId = String(orig.id_str ?? orig.id ?? '');
+  const origMedia: string[] = [];
+  if (Array.isArray(major.draw?.items)) origMedia.push(...major.draw.items.map((entry: JsonObject) => entry.src).filter(Boolean));
+  if (major.article?.covers) origMedia.push(...major.article.covers);
+  if (major.opus?.pics) origMedia.push(...major.opus.pics.map((entry: JsonObject) => entry.url).filter(Boolean));
+  const avatar = author.face ? normalizeImageUrl(String(author.face)) : null;
+  return {
+    kind: 'forward',
+    authorName: String(author.name ?? '原动态作者'),
+    authorUid: author.mid != null ? String(author.mid) : null,
+    authorAvatarUrl: avatar,
+    text: String(dynamic.desc?.text ?? summary?.text ?? ''),
+    emojiMap: extractEmojiMap(description),
+    sourceUrl: origId ? `https://www.bilibili.com/opus/${origId}` : null,
+    originalType: String(orig.type ?? 'DYNAMIC_TYPE_UNKNOWN'),
+    mediaUrls: normalizeImageUrls(origMedia.map(String)),
+    video: normalizeVideoCard(major.archive),
+    unavailable: false
+  };
+}
+
+function normalizeVideoCard(archive: JsonObject | null | undefined): DynamicVideoCard | null {
+  if (!archive || typeof archive !== 'object') return null;
+  const jumpUrl = normalizeBilibiliUrl(archive.jump_url ?? archive.url);
+  const bvid = archive.bvid ? String(archive.bvid) : '';
+  const aid = archive.avid ?? archive.aid;
+  const url = jumpUrl || (bvid ? `https://www.bilibili.com/video/${bvid}` : aid ? `https://www.bilibili.com/video/av${aid}` : '');
+  return {
+    kind: 'video',
+    title: String(archive.title ?? '投稿视频'),
+    description: String(archive.desc ?? ''),
+    url,
+    coverUrl: archive.cover ? normalizeImageUrl(String(archive.cover)) : null,
+    durationText: archive.duration_text ? String(archive.duration_text) : null,
+    badge: archive.badge?.text ? String(archive.badge.text) : archive.badge?.text_content ? String(archive.badge.text_content) : null,
+    viewCount: statText(archive.stat?.play),
+    danmakuCount: statText(archive.stat?.danmaku)
+  };
+}
+
+function extractEmojiMap(desc: JsonObject | null | undefined): Record<string, string> {
+  const result: Record<string, string> = {};
+  const nodes = Array.isArray(desc?.rich_text_nodes) ? desc.rich_text_nodes : [];
+  for (const node of nodes) {
+    const token = node?.text ?? node?.orig_text;
+    const icon = node?.emoji?.icon_url ?? node?.emoji?.url;
+    if (token && icon) result[String(token)] = normalizeImageUrl(String(icon));
+  }
+  return result;
+}
+
+function normalizeBilibiliUrl(value: unknown): string {
+  if (!value) return '';
+  const url = String(value);
+  if (url.startsWith('//')) return `https:${url}`;
+  if (url.startsWith('/')) return `https://www.bilibili.com${url}`;
+  return url;
+}
+
+function statText(value: unknown): string | null {
+  if (value == null) return null;
+  if (typeof value === 'object') {
+    const object = value as JsonObject;
+    return object.count != null ? String(object.count) : object.text != null ? String(object.text) : null;
+  }
+  return String(value);
 }
 
 function dynamicPublishedAt(item: JsonObject): string {

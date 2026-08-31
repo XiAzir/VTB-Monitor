@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { ArchiveCursor, CommentRecord, DynamicRecord, ForecastRecord, LiveStatus, MediaAsset, ScheduleDraftEntry, StreamerSummary } from '$lib/types';
+import type { ArchiveCursor, CommentRecord, DynamicCard, DynamicRecord, ForecastRecord, LiveStatus, MediaAsset, ScheduleDraftEntry, StreamerSummary } from '$lib/types';
 import { config } from './config';
 import { getDb, withTransaction } from './db';
 import type { SQLInputValue } from 'node:sqlite';
@@ -33,6 +33,7 @@ export interface NormalizedDynamicInput {
   text: string;
   sourceUrl: string;
   publishedAt: string;
+  editedAt?: string | null;
   commentOid?: string | null;
   commentType?: string | null;
   commentCount?: number;
@@ -41,6 +42,8 @@ export interface NormalizedDynamicInput {
   rawExcerpt?: string | null;
   emojiMap?: Record<string, string>;
   avatarUrl?: string | null;
+  isPinned?: boolean;
+  detailRequired?: boolean;
   contentQuality?: 'feed' | 'detail' | 'restored';
   detailFetchedAt?: string | null;
 }
@@ -93,6 +96,7 @@ export interface DynamicRevisionRecord {
   snapshot: Row;
   media: MediaAsset[];
   emojiMap: Record<string, string>;
+  card: DynamicCard | null;
 }
 
 export interface NormalizedCommentInput {
@@ -170,7 +174,8 @@ export function listStreamerSummaries(): StreamerSummary[] {
             f.reason AS forecast_reason, f.stale AS forecast_stale, f.uncertainty_minutes,
             (EXISTS(SELECT 1 FROM schedule_exceptions se WHERE se.streamer_id=s.id AND se.occurrence_date=date('now','localtime')
               AND se.status='cancelled') OR EXISTS(SELECT 1 FROM timeline_events te WHERE te.streamer_id=s.id AND te.active=1
-              AND te.event_type='cancelled' AND date(COALESCE(te.planned_start_at,te.occurred_at,te.created_at),'localtime')=date('now','localtime')))
+              AND te.event_type='cancelled' AND te.planned_start_at IS NOT NULL
+              AND date(te.planned_start_at,'localtime')=date('now','localtime')))
               AND COALESCE(f.source,'')!='manual' AS cancelled_today
     FROM streamers s
     LEFT JOIN live_state ls ON ls.streamer_id = s.id
@@ -206,7 +211,8 @@ export function getStreamerBySlug(slug: string): (StreamerSummary & { timezone: 
            f.stale AS forecast_stale, f.uncertainty_minutes,
            (EXISTS(SELECT 1 FROM schedule_exceptions se WHERE se.streamer_id=s.id AND se.occurrence_date=date('now','localtime')
              AND se.status='cancelled') OR EXISTS(SELECT 1 FROM timeline_events te WHERE te.streamer_id=s.id AND te.active=1
-             AND te.event_type='cancelled' AND date(COALESCE(te.planned_start_at,te.occurred_at,te.created_at),'localtime')=date('now','localtime')))
+             AND te.event_type='cancelled' AND te.planned_start_at IS NOT NULL
+             AND date(te.planned_start_at,'localtime')=date('now','localtime')))
              AND COALESCE(f.source,'')!='manual' AS cancelled_today
     FROM streamers s
     LEFT JOIN live_state ls ON ls.streamer_id = s.id
@@ -332,11 +338,15 @@ export function listDynamics(streamerId: string, limit = 20, before?: string): D
 }
 
 function rowToDynamic(row: Row): DynamicRecord {
+  const lastEditedAt = String(row.last_content_change_at ?? row.published_at);
   return {
     id: String(row.id), streamerId: String(row.streamer_id), type: String(row.type), text: String(row.text),
     sourceUrl: String(row.source_url), state: String(row.state) as DynamicRecord['state'],
-    publishedAt: String(row.published_at), updatedAt: String(row.updated_at), commentCount: number(row.comment_count),
-    likeCount: number(row.like_count), media: listMediaFor('dynamic', String(row.id)), emojiMap: parseEmojiMap(row.raw_excerpt)
+    publishedAt: String(row.published_at), updatedAt: String(row.updated_at), lastEditedAt,
+    lastEditedAtSource: lastEditedAt === String(row.published_at) ? 'published_fallback' : 'observed_revision', isPinned: bool(row.is_pinned),
+    commentCount: number(row.comment_count),
+    likeCount: number(row.like_count), media: listMediaFor('dynamic', String(row.id)), emojiMap: parseEmojiMap(row.raw_excerpt),
+    card: parseDynamicCard(row.raw_excerpt)
   };
 }
 
@@ -348,7 +358,8 @@ export function getDynamic(id: string): DynamicRecord | null {
 export function listDynamicRevisions(id: string): DynamicRevisionRecord[] {
   return (getDb().prepare('SELECT id,dynamic_id,text,created_at,snapshot_json FROM dynamic_revisions WHERE dynamic_id=? ORDER BY created_at DESC').all(id) as Row[])
     .map((row) => { const snapshot = safeJson<Row>(String(row.snapshot_json), {}); return { id: String(row.id), dynamicId: String(row.dynamic_id), text: String(row.text),
-      createdAt: String(row.created_at), snapshot, media: listMediaByUrls(Array.isArray(snapshot.mediaUrls) ? snapshot.mediaUrls.map(String) : []), emojiMap: parseEmojiMap(snapshot.raw_excerpt) }; });
+      createdAt: String(row.created_at), snapshot, media: listMediaByUrls(Array.isArray(snapshot.mediaUrls) ? snapshot.mediaUrls.map(String) : []),
+      emojiMap: parseEmojiMap(snapshot.raw_excerpt), card: parseDynamicCard(snapshot.raw_excerpt) }; });
 }
 
 export function getLatestCompleteDynamicSnapshot(id: string): { text: string; mediaUrls: string[]; emojiMap: Record<string, string> } | null {
@@ -372,7 +383,8 @@ export function getDynamicRevision(id: string, revisionId: string): DynamicRevis
   if (!row) return null;
   const snapshot = safeJson<Row>(String(row.snapshot_json), {});
   return { id: String(row.id), dynamicId: String(row.dynamic_id), text: String(row.text), createdAt: String(row.created_at), snapshot,
-    media: listMediaByUrls(Array.isArray(snapshot.mediaUrls) ? snapshot.mediaUrls.map(String) : []), emojiMap: parseEmojiMap(snapshot.raw_excerpt) };
+    media: listMediaByUrls(Array.isArray(snapshot.mediaUrls) ? snapshot.mediaUrls.map(String) : []), emojiMap: parseEmojiMap(snapshot.raw_excerpt),
+    card: parseDynamicCard(snapshot.raw_excerpt) };
 }
 
 export function markDynamicDeleted(id: string): void {
@@ -450,21 +462,28 @@ export function listReplies(dynamicId: string, rootId: string): CommentRecord[] 
     .all(dynamicId, rootId) as Row[]).map(rowToComment);
 }
 
-export function upsertDynamic(input: NormalizedDynamicInput): { created: boolean; changed: boolean } {
+export function upsertDynamic(input: NormalizedDynamicInput): { created: boolean; changed: boolean; revisionId: string | null; contentHash: string } {
   const db = getDb();
   const timestamp = now();
-  const hash = contentHash({ type: input.type, text: input.text, media: input.mediaUrls ?? [], emojiMap: input.emojiMap ?? {} });
   const existing = db.prepare('SELECT * FROM dynamics WHERE id = ?').get(input.id) as Row | undefined;
+  const effectiveRaw = input.rawExcerpt === undefined ? text(existing?.raw_excerpt) : input.rawExcerpt;
+  const effectiveEmojiMap = input.emojiMap === undefined ? parseEmojiMap(existing?.raw_excerpt) : input.emojiMap;
+  const effectivePinned = input.isPinned === undefined ? bool(existing?.is_pinned) : input.isPinned;
+  const hash = contentHash({ type: input.type, text: input.text, media: input.mediaUrls ?? [], emojiMap: effectiveEmojiMap,
+    card: dynamicCardContentSignature(parseDynamicCard(effectiveRaw)) });
   let changed = false;
+  let revisionId: string | null = null;
   let effectiveQuality = input.contentQuality ?? 'feed';
   withTransaction((tx) => {
     if (!existing) {
       tx.prepare(`INSERT INTO dynamics(id, streamer_id, type, text, source_url, published_at, updated_at, last_seen_at,
-        content_hash, comment_oid, comment_type, comment_count, like_count, raw_excerpt,content_quality,detail_fetched_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        content_hash, comment_oid, comment_type, comment_count, like_count, raw_excerpt,content_quality,detail_fetched_at,
+        is_pinned,last_content_change_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(input.id, input.streamerId, input.type, input.text, input.sourceUrl, input.publishedAt, timestamp, timestamp,
           hash, input.commentOid ?? null, input.commentType ?? null, input.commentCount ?? 0, input.likeCount ?? 0,
-          mergeRawExcerpt(input.rawExcerpt, input.emojiMap), input.contentQuality ?? 'feed', input.detailFetchedAt ?? null);
+          mergeRawExcerpt(effectiveRaw, effectiveEmojiMap), input.contentQuality ?? 'feed', input.detailFetchedAt ?? null,
+          effectivePinned ? 1 : 0, input.editedAt ?? input.publishedAt);
       tx.prepare(`INSERT INTO comment_sync_state(dynamic_id, next_sync_at, updated_at) VALUES (?, ?, ?)`)
         .run(input.id, timestamp, timestamp);
       changed = true;
@@ -474,28 +493,34 @@ export function upsertDynamic(input: NormalizedDynamicInput): { created: boolean
         effectiveQuality = String(existing.content_quality) as 'detail' | 'restored';
       }
       if (changed) {
-        const oldMedia = tx.prepare(`SELECT COALESCE(dm.source_url,m.source_url) AS source_url FROM media_assets m
+        const oldMedia = tx.prepare(`SELECT COALESCE(dm.source_url,m.source_url) AS source_url,m.sha256,m.state FROM media_assets m
           JOIN dynamic_media dm ON dm.media_id=m.id WHERE dm.dynamic_id=? ORDER BY dm.position`).all(input.id) as Row[];
-        const snapshot = { ...existing, mediaUrls: oldMedia.map((row) => String(row.source_url)) };
+        const snapshot = { ...existing, mediaUrls: oldMedia.map((row) => String(row.source_url)),
+          mediaSignatures: oldMedia.map((row) => String(row.sha256 ?? row.source_url)),
+          mediaStates: oldMedia.map((row) => String(row.state)) };
+        revisionId = randomUUID();
         tx.prepare(`INSERT INTO dynamic_revisions(id, dynamic_id, text, content_hash, snapshot_json, created_at)
                     VALUES (?, ?, ?, ?, ?, ?)`)
-          .run(randomUUID(), input.id, String(existing.text), String(existing.content_hash), JSON.stringify(snapshot), timestamp);
+          .run(revisionId, input.id, String(existing.text), String(existing.content_hash), JSON.stringify(snapshot), timestamp);
       }
       tx.prepare(`UPDATE dynamics SET type=?, text=?, source_url=?, state='visible', updated_at=?, last_seen_at=?,
                    content_hash=?, comment_oid=COALESCE(?, comment_oid), comment_type=COALESCE(?, comment_type),
                    comment_count=?, like_count=?, raw_excerpt=?,content_quality=?,detail_fetched_at=COALESCE(?,detail_fetched_at),
+                   is_pinned=?,last_content_change_at=CASE WHEN ? IS NOT NULL THEN ? WHEN ?=1 THEN ? ELSE COALESCE(last_content_change_at,published_at) END,
                    missing_complete_scans=0,last_missing_scan_id=NULL,first_missing_at=NULL,deletion_confirmed_at=NULL WHERE id=?`)
         .run(input.type, input.text, input.sourceUrl, timestamp, timestamp, hash, input.commentOid ?? null,
-          input.commentType ?? null, input.commentCount ?? 0, input.likeCount ?? 0, mergeRawExcerpt(input.rawExcerpt, input.emojiMap),
-          effectiveQuality, input.detailFetchedAt ?? null, input.id);
+          input.commentType ?? null, input.commentCount ?? 0, input.likeCount ?? 0, mergeRawExcerpt(effectiveRaw, effectiveEmojiMap),
+          effectiveQuality, input.detailFetchedAt ?? null, effectivePinned ? 1 : 0, input.editedAt ?? null, input.editedAt ?? null,
+          changed ? 1 : 0, timestamp, input.id);
     }
     tx.prepare('DELETE FROM dynamic_media WHERE dynamic_id=?').run(input.id);
     linkMediaUrls(tx, 'dynamic', input.id, input.mediaUrls ?? []);
   });
-  if (!existing || changed) enqueueJob('pi_analyze', input.streamerId, { dynamicId: input.id }, 30, timestamp, `pi-dynamic:${input.id}:${hash}`);
-  if ((!existing || changed) && isScheduleCandidate(input.text, input.mediaUrls ?? [])) createScheduleDraftCandidate(input.streamerId, input.id, hash, input.mediaUrls ?? []);
+  if ((!existing || changed) && isScheduleCandidate(input.type, input.text, input.mediaUrls ?? [])) {
+    createScheduleDraftCandidate(input.streamerId, input.id, hash, input.mediaUrls ?? []);
+  }
   if (!existing) enqueueJob('sync_comments', input.id, {}, 50, timestamp, `comments:${input.id}:initial`);
-  return { created: !existing, changed };
+  return { created: !existing, changed, revisionId, contentHash: hash };
 }
 
 export function upsertComment(input: NormalizedCommentInput): { created: boolean; changed: boolean; highSignal: boolean } {
@@ -528,11 +553,7 @@ export function upsertComment(input: NormalizedCommentInput): { created: boolean
     tx.prepare('DELETE FROM comment_media WHERE comment_id=?').run(input.id);
     linkMediaUrls(tx, 'comment', input.id, input.mediaUrls ?? []);
   });
-  const highSignal = Boolean(input.isStreamer || input.isPinned || containsTimeSignal(input.message));
-  if ((!existing || changed) && highSignal) {
-    const dynamic = getDb().prepare('SELECT streamer_id FROM dynamics WHERE id = ?').get(input.dynamicId) as Row;
-    enqueueJob('pi_analyze', String(dynamic.streamer_id), { commentId: input.id }, 35, timestamp, `pi-comment:${input.id}:${hash}`);
-  }
+  const highSignal = false;
   return { created: !existing, changed, highSignal };
 }
 
@@ -574,7 +595,6 @@ export function rollOverdueForecasts(): number {
       AND COALESCE(ls.status, 'offline') != 'live'`).all(now()) as Row[];
   for (const row of rows) {
     getDb().prepare('UPDATE forecasts SET stale=1 WHERE id=?').run(String(row.id));
-    enqueueJob('pi_analyze', String(row.streamer_id), { reason: 'forecast_overdue' }, 15, now(), `pi-overdue:${row.id}`);
     const noShowAt = new Date(String(row.predicted_start_at)).getTime() + 6 * 3600_000;
     if (Date.now() >= noShowAt) recordNoShowEvaluation(String(row.id));
     if (['schedule_confirmed', 'weekly_schedule'].includes(String(row.source))) refreshForecastFromSchedules(String(row.streamer_id));
@@ -617,7 +637,6 @@ export function updateLiveState(streamerId: string, status: LiveStatus, title: s
       }
     }
   });
-  if (changed) enqueueJob('pi_analyze', streamerId, { liveStatus: status }, 5, timestamp, `pi-live:${streamerId}:${status}:${timestamp.slice(0, 16)}`);
   return changed;
 }
 
@@ -663,6 +682,123 @@ export function failJob(id: string, error: unknown, retryDelayMs: number): void 
 
 export function listJobs(limit = 50): Row[] {
   return getDb().prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?').all(clamp(limit, 1, 200)) as Row[];
+}
+
+export function stagePiDynamicIds(streamerId: string, dynamicIds: string[]): number {
+  const uniqueIds = [...new Set(dynamicIds.filter(Boolean))];
+  const timestamp = now();
+  return withTransaction((db) => {
+    for (const dynamicId of uniqueIds) {
+      db.prepare(`INSERT INTO pi_pending_dynamics(streamer_id,dynamic_id,detected_at) VALUES (?, ?, ?)
+        ON CONFLICT(streamer_id,dynamic_id) DO UPDATE SET detected_at=MIN(pi_pending_dynamics.detected_at,excluded.detected_at)`)
+        .run(streamerId, dynamicId, timestamp);
+    }
+    return uniqueIds.length;
+  });
+}
+
+export function queuePiDynamicBatch(streamerId: string, dynamicIds: string[], baseline = false, delayMs = 30_000): string | null {
+  stagePiDynamicIds(streamerId, dynamicIds);
+  const timestamp = now();
+  return withTransaction((db) => {
+    const cursor = db.prepare('SELECT baseline_completed_at FROM pi_event_cursors WHERE streamer_id=?').get(streamerId) as Row | undefined;
+    const mode = baseline || !cursor?.baseline_completed_at ? 'baseline' : 'incremental';
+    const triggerReason = mode === 'baseline' ? 'baseline_sync_completed' : 'streamer_content_added';
+    const existing = db.prepare(`SELECT id,payload_json FROM jobs WHERE type='pi_analyze' AND entity_id=?
+      AND status IN ('pending','retry') ORDER BY created_at LIMIT 1`).get(streamerId) as Row | undefined;
+    if (existing) {
+      if (mode === 'baseline') db.prepare(`UPDATE jobs SET payload_json=?,priority=MIN(priority,?),updated_at=? WHERE id=? AND status IN ('pending','retry')`)
+        .run(JSON.stringify({ mode, triggerReason }), 25, timestamp, String(existing.id));
+      return String(existing.id);
+    }
+    const pending = db.prepare('SELECT COUNT(*) count FROM pi_pending_dynamics WHERE streamer_id=?').get(streamerId) as Row;
+    if (number(pending.count) === 0 && mode !== 'baseline') return null;
+    const id = randomUUID();
+    db.prepare(`INSERT INTO jobs(id,type,entity_id,payload_json,priority,due_at,dedupe_key,created_at,updated_at)
+      VALUES (?, 'pi_analyze', ?, ?, 25, ?, ?, ?, ?)`)
+      .run(id, streamerId, JSON.stringify({ mode, triggerReason }), new Date(Date.now() + Math.max(0, delayMs)).toISOString(),
+        `pi-batch:${streamerId}:${id}`, timestamp, timestamp);
+    return id;
+  });
+}
+
+export function queuePiManualAnalysis(streamerId: string, reason = 'manual', instruction?: string): string {
+  const id = randomUUID();
+  const timestamp = now();
+  const trimmedInstruction = instruction?.trim();
+  if (trimmedInstruction && trimmedInstruction.length > 4000) throw new Error('本轮分析指令不能超过 4000 字符');
+  getDb().prepare(`INSERT INTO jobs(id,type,entity_id,payload_json,priority,due_at,dedupe_key,created_at,updated_at)
+    VALUES (?, 'pi_analyze', ?, ?, 10, ?, ?, ?, ?)`)
+    .run(id, streamerId, JSON.stringify({ mode: 'baseline', force: true, reason, instruction: trimmedInstruction || undefined }), timestamp,
+      `pi-manual:${streamerId}:${id}`, timestamp, timestamp);
+  return id;
+}
+
+export function isDynamicAnalysisCurrent(dynamicId: string, contentHash: string): boolean {
+  const row = getDb().prepare('SELECT content_hash FROM pi_dynamic_analysis_versions WHERE dynamic_id=?').get(dynamicId) as Row | undefined;
+  return Boolean(row && String(row.content_hash) === contentHash);
+}
+
+export function queuePiRevisionAnalysis(revisionId: string, dynamicId: string, delayMs = 30_000): string | null {
+  const revision = getDb().prepare('SELECT id FROM dynamic_revisions WHERE id=? AND dynamic_id=?').get(revisionId, dynamicId) as Row | undefined;
+  if (!revision) return null;
+  const timestamp = now();
+  getDb().prepare(`INSERT INTO pi_revision_analyses(revision_id,dynamic_id,created_at,updated_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT(revision_id) DO NOTHING`).run(revisionId, dynamicId, timestamp, timestamp);
+  return enqueueJob('pi_revision', revisionId, { dynamicId }, 24,
+    new Date(Date.now() + Math.max(0, delayMs)).toISOString(), `pi-revision:${revisionId}`);
+}
+
+export function acquirePiStreamerLease(streamerId: string, ttlMs = 10 * 60_000): string | null {
+  const token = randomUUID();
+  const timestamp = now();
+  const result = getDb().prepare(`INSERT INTO pi_streamer_leases(streamer_id,lease_token,lease_until,updated_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT(streamer_id) DO UPDATE SET lease_token=excluded.lease_token,lease_until=excluded.lease_until,updated_at=excluded.updated_at
+    WHERE pi_streamer_leases.lease_until < ?`).run(streamerId, token, new Date(Date.now() + ttlMs).toISOString(), timestamp, timestamp);
+  return result.changes > 0 ? token : null;
+}
+
+export function releasePiStreamerLease(streamerId: string, token: string): void {
+  getDb().prepare('DELETE FROM pi_streamer_leases WHERE streamer_id=? AND lease_token=?').run(streamerId, token);
+}
+
+export function renewPiStreamerLease(streamerId: string, token: string, ttlMs = 10 * 60_000): boolean {
+  const timestamp = now();
+  const result = getDb().prepare(`UPDATE pi_streamer_leases SET lease_until=?,updated_at=?
+    WHERE streamer_id=? AND lease_token=?`).run(new Date(Date.now() + ttlMs).toISOString(), timestamp, streamerId, token);
+  return result.changes > 0;
+}
+
+export function acquireServiceLease(name: string, ttlMs: number, owner: string = config.processId): boolean {
+  const timestamp = now();
+  const result = getDb().prepare(`INSERT INTO service_leases(name,lease_owner,lease_until,updated_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT(name) DO UPDATE SET lease_owner=excluded.lease_owner,lease_until=excluded.lease_until,updated_at=excluded.updated_at
+    WHERE service_leases.lease_owner=excluded.lease_owner OR service_leases.lease_until < ?`)
+    .run(name, owner, new Date(Date.now() + ttlMs).toISOString(), timestamp, timestamp);
+  return result.changes > 0;
+}
+
+export function releaseServiceLease(name: string, owner: string = config.processId): void {
+  getDb().prepare('DELETE FROM service_leases WHERE name=? AND lease_owner=?').run(name, owner);
+}
+
+export function deactivateDynamicTimelineEvents(streamerId: string, dynamicId: string, ids?: string[]): number {
+  const timestamp = now();
+  const selected = ids?.length ? `AND id IN (${ids.map(() => '?').join(',')})` : '';
+  const result = getDb().prepare(`UPDATE timeline_events SET active=0,updated_at=? WHERE streamer_id=? AND source_type='dynamic'
+    AND source_id=? ${selected}`).run(timestamp, streamerId, dynamicId, ...(ids ?? []));
+  return Number(result.changes);
+}
+
+export function staleForecastsUsingDynamic(streamerId: string, dynamicId: string): number {
+  const rows = getDb().prepare(`SELECT id,evidence_json FROM forecasts WHERE streamer_id=? AND active=1 AND stale=0 AND source!='manual'`)
+    .all(streamerId) as Row[];
+  const ids = rows.filter((row) => safeJson<Array<{ type?: string; id?: string }>>(String(row.evidence_json ?? '[]'), [])
+    .some((item) => item.id === dynamicId || (item.type === 'timeline_event' && item.id != null && getDb().prepare(
+      "SELECT 1 FROM timeline_events WHERE id=? AND source_type='dynamic' AND source_id=?").get(item.id, dynamicId))))
+    .map((row) => String(row.id));
+  for (const id of ids) getDb().prepare('UPDATE forecasts SET stale=1 WHERE id=?').run(id);
+  return ids.length;
 }
 
 export function putSecret(key: string, value: string, actor = 'admin-ui'): void {
@@ -763,6 +899,18 @@ export function acknowledgeAlert(id: string, actor = 'admin-ui'): void {
   insertAudit(getDb(), actor, null, 'alert.acknowledge', 'alert', id, null, { status: 'acknowledged' });
 }
 
+export function acknowledgeAllAlerts(actor = 'admin-ui'): number {
+  const db = getDb();
+  const rows = db.prepare("SELECT id FROM alerts WHERE status='open'").all() as Row[];
+  if (rows.length === 0) return 0;
+  withTransaction((tx) => {
+    const timestamp = now();
+    tx.prepare("UPDATE alerts SET status='acknowledged',acknowledged_at=? WHERE status='open'").run(timestamp);
+    for (const row of rows) insertAudit(tx, actor, null, 'alert.acknowledge_all', 'alert', String(row.id), null, { status: 'acknowledged' });
+  });
+  return rows.length;
+}
+
 export function resolveAlert(fingerprint: string, actor = 'system'): void {
   const rows = getDb().prepare("SELECT id FROM alerts WHERE fingerprint=? AND status='open'").all(fingerprint) as Row[];
   if (rows.length === 0) return;
@@ -827,7 +975,7 @@ export function createScheduleDraftCandidate(streamerId: string, dynamicId: stri
   const dynamic = getDb().prepare('SELECT text FROM dynamics WHERE id=?').get(dynamicId) as Row;
   getDb().prepare(`INSERT INTO schedule_drafts(id,streamer_id,dynamic_id,content_hash,source_text,media_urls_json,created_at,updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(id, streamerId, dynamicId, contentHashValue, String(dynamic.text ?? ''),
-      JSON.stringify(mediaUrls.slice(0, 4)), timestamp, timestamp);
+      JSON.stringify(mediaUrls), timestamp, timestamp);
   enqueueJob('recognize_schedule', id, {}, 40, timestamp, `recognize-schedule:${id}`);
   return id;
 }
@@ -836,7 +984,7 @@ export function createManualScheduleDraft(dynamicId: string): string {
   const dynamic = getDb().prepare('SELECT id,streamer_id,content_hash FROM dynamics WHERE id=?').get(dynamicId) as Row | undefined;
   if (!dynamic) throw new Error('动态不存在');
   const urls = (getDb().prepare(`SELECT m.source_url FROM dynamic_media dm JOIN media_assets m ON m.id=dm.media_id
-    WHERE dm.dynamic_id=? ORDER BY dm.position LIMIT 4`).all(dynamicId) as Row[]).map((row) => String(row.source_url));
+    WHERE dm.dynamic_id=? ORDER BY dm.position`).all(dynamicId) as Row[]).map((row) => String(row.source_url));
   if (urls.length === 0) throw new Error('该动态没有可识别的正文图片');
   return createScheduleDraftCandidate(String(dynamic.streamer_id), dynamicId, String(dynamic.content_hash), urls);
 }
@@ -925,7 +1073,6 @@ export function confirmScheduleDraft(id: string, monday: string | null, reviewer
       .run(timestamp, reviewer, timestamp, id);
   });
   refreshForecastFromSchedules(String(draft.streamerId));
-  enqueueJob('pi_analyze', String(draft.streamerId), { scheduleDraftId: id }, 10, timestamp, `pi-schedule-confirmed:${id}`);
   return entries.length;
 }
 
@@ -1032,11 +1179,16 @@ export function upsertScheduleException(streamerId: string, exception: { occurre
 }
 
 export function recordAiUsage(input: { provider: string; model: string; purpose: string; streamerId?: string;
-  inputTokens?: number; outputTokens?: number; cost?: number; success: boolean; error?: string }): void {
-  getDb().prepare(`INSERT INTO ai_usage(id,provider,model,purpose,streamer_id,input_tokens,output_tokens,cost,success,error,created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+  inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; cost?: number;
+  success: boolean; error?: string; latencyMs?: number; batchId?: string; triggerReason?: string; inputItemCount?: number;
+  attemptNumber?: number }): void {
+  getDb().prepare(`INSERT INTO ai_usage(id,provider,model,purpose,streamer_id,input_tokens,output_tokens,cost,success,error,created_at,
+    cache_read_tokens,cache_write_tokens,latency_ms,batch_id,trigger_reason,input_item_count,attempt_number)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(randomUUID(), input.provider, input.model, input.purpose, input.streamerId ?? null, input.inputTokens ?? null,
-      input.outputTokens ?? null, input.cost ?? null, input.success ? 1 : 0, input.error?.slice(0, 2000) ?? null, now());
+      input.outputTokens ?? null, input.cost ?? null, input.success ? 1 : 0, input.error?.slice(0, 2000) ?? null, now(),
+      input.cacheReadTokens ?? null, input.cacheWriteTokens ?? null, input.latencyMs ?? null, input.batchId ?? null,
+      input.triggerReason ?? null, input.inputItemCount ?? null, input.attemptNumber ?? null);
 }
 
 export function getDashboardStats(): Record<string, number> {
@@ -1081,11 +1233,17 @@ function mergeRawExcerpt(raw: string | null | undefined, emojiMap?: Record<strin
   if (!raw && !emojiMap) return null;
   let value: Row = {};
   try { value = raw ? JSON.parse(raw) as Row : {}; } catch { value = { excerpt: raw?.slice(0, 2000) }; }
-  if (emojiMap && Object.keys(emojiMap).length > 0) value = { emojiMap, ...value };
+  if (emojiMap) value = { ...value, emojiMap };
   const serialized = JSON.stringify(value);
-  if (serialized.length <= 4000) return serialized;
+  if (serialized.length <= 64_000) return serialized;
+  if (value.card && typeof value.card === 'object') {
+    const card = value.card as Row;
+    const trimmedCard = card.kind === 'forward' ? { ...card, text: String(card.text ?? '').slice(0, 24_000) } : card;
+    const structured = JSON.stringify({ card: trimmedCard, emojiMap: emojiMap ?? value.emojiMap ?? {} });
+    if (structured.length <= 64_000) return structured;
+  }
   const compact = emojiMap && Object.keys(emojiMap).length > 0 ? JSON.stringify({ emojiMap }) : JSON.stringify({ excerpt: raw?.slice(0, 2000) });
-  return compact.length <= 4000 ? compact : JSON.stringify({ excerpt: '元数据过长，已省略' });
+  return compact.length <= 64_000 ? compact : JSON.stringify({ excerpt: '元数据过长，已省略' });
 }
 
 function parseEmojiMap(raw: unknown): Record<string, string> {
@@ -1094,6 +1252,26 @@ function parseEmojiMap(raw: unknown): Record<string, string> {
     const value = JSON.parse(String(raw)) as Row;
     return value.emojiMap && typeof value.emojiMap === 'object' ? value.emojiMap as Record<string, string> : {};
   } catch { return {}; }
+}
+
+function parseDynamicCard(raw: unknown): DynamicCard | null {
+  if (!raw) return null;
+  try {
+    const value = typeof raw === 'string' ? JSON.parse(raw) as Row : raw as Row;
+    const card = value.card;
+    if (!card || typeof card !== 'object') return null;
+    const kind = (card as Row).kind;
+    return kind === 'video' || kind === 'forward' ? card as DynamicCard : null;
+  } catch { return null; }
+}
+
+function dynamicCardContentSignature(card: DynamicCard | null): unknown {
+  if (!card) return null;
+  if (card.kind === 'video') {
+    const { viewCount: _viewCount, danmakuCount: _danmakuCount, ...content } = card;
+    return content;
+  }
+  return { ...card, video: card.video ? dynamicCardContentSignature(card.video) : null };
 }
 
 function linkMediaUrls(db: ReturnType<typeof getDb>, kind: 'dynamic' | 'comment', ownerId: string, urls: string[]): void {
@@ -1128,6 +1306,11 @@ function rowToSummary(row: Row): StreamerSummary {
   const stale = bool(row.forecast_stale);
   const forecastStatus = liveStatus === 'live' ? 'live' : bool(row.cancelled_today) ? 'cancelled_today'
     : stale ? 'stale' : confidence == null || confidence < 40 ? 'insufficient' : confidence >= 70 ? 'exact' : 'range';
+  const forecastReason = forecastStatus === 'live' ? '直播间状态已确认正在直播。'
+    : forecastStatus === 'cancelled_today' ? '已确认今天取消直播。'
+      : forecastStatus === 'stale' ? '旧预测已过期，等待主播本人发布新内容或管理员重新分析。'
+        : forecastStatus === 'insufficient' && row.forecast_source === 'fallback' ? '暂无足以形成可靠预测的证据。'
+          : text(row.forecast_reason);
   return {
     id: String(row.id), slug: String(row.slug), name: String(row.name), biliUid: String(row.bili_uid),
     roomId: String(row.room_id), resolvedRoomId: text(row.resolved_room_id), roomShortId: text(row.room_short_id),
@@ -1135,7 +1318,7 @@ function rowToSummary(row: Row): StreamerSummary {
     avatarUrl: text(row.avatar_url), liveStatus,
     liveTitle: text(row.live_title), predictedStartAt: text(row.predicted_start_at),
     confidence, forecastSource: row.forecast_source as StreamerSummary['forecastSource'] ?? null,
-    forecastReason: forecastStatus === 'cancelled_today' ? '已确认今天取消直播。' : text(row.forecast_reason), forecastStale: stale, forecastStatus,
+    forecastReason, forecastStale: stale, forecastStatus,
     uncertaintyMinutes: row.uncertainty_minutes == null ? null : number(row.uncertainty_minutes), lastCheckedAt: text(row.checked_at)
   };
 }
@@ -1169,12 +1352,11 @@ function normalizeSlug(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9-_]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
-function containsTimeSignal(message: string): boolean {
-  return /(周表|开播|直播|今晚|明晚|今天|明天|后天|迟到|晚点|推迟|延后|请假|休息|加播|\d{1,2}\s*[:：点时]\s*\d{0,2})/i.test(message);
-}
-
-function isScheduleCandidate(message: string, mediaUrls: string[]): boolean {
-  return mediaUrls.length > 0 && /(周表|日程|本周|直播安排|直播日历|直播计划)/i.test(message);
+function isScheduleCandidate(type: string, message: string, mediaUrls: string[]): boolean {
+  // A forward's media belongs to the original post, while its outer text belongs to the monitored streamer.
+  // Combining the two creates false schedule candidates such as "周表换了" over unrelated reposted artwork.
+  return type !== 'DYNAMIC_TYPE_FORWARD' && type !== 'forward' && mediaUrls.length > 0
+    && /(周表|日程|本周|这周|突击|直播安排|直播日历|直播计划)/i.test(message);
 }
 
 export function encodeArchiveCursor(cursor: ArchiveCursor): string {

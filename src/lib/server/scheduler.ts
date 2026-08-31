@@ -4,17 +4,22 @@ import { config } from './config';
 import { getDb } from './db';
 import { downloadMediaAsset } from './media';
 import {
-  enqueueJob, failJob, finishJob, getDynamic, getLatestCompleteDynamicSnapshot, getSecret, leaseNextJob, rollOverdueForecasts,
+  acquireServiceLease, enqueueJob, failJob, finishJob, getDynamic, getLatestCompleteDynamicSnapshot, getSecret, getSetting, leaseNextJob, releaseServiceLease, rollOverdueForecasts,
   markMissingRepliesUnavailable, markMissingRootCommentsUnavailable,
   resolveAlert, updateLiveState, updateRoomMapping, updateSecretStatus, upsertAlert, upsertComment, upsertDynamic,
-  markDynamicDeleted, markMissingDynamicsDeleted
+  markDynamicDeleted, markMissingDynamicsDeleted, queuePiDynamicBatch, queuePiRevisionAnalysis, stagePiDynamicIds
 } from './store';
 import { sendAlertEmail } from './alerts';
-import { analyzeStreamerWithPi, recognizeScheduleDraftWithPi } from './pi';
+import { analyzeDynamicRevisionWithPi, analyzeStreamerWithPi, recognizeScheduleDraftWithPi } from './pi';
+import { cleanupStorage } from './storage-maintenance';
 
 type Row = Record<string, any>;
 
 let scheduler: Scheduler | undefined;
+
+function createBilibiliClient(cookie: string | null): BilibiliClient {
+  return new BilibiliClient(cookie, getSetting<string | null>('bilibili_proxy_url', null));
+}
 
 export function startScheduler(): Scheduler {
   scheduler ??= new Scheduler();
@@ -31,6 +36,7 @@ export class Scheduler {
   private timers: NodeJS.Timeout[] = [];
   private running = false;
   private workerActive = false;
+  private readonly workerLeaseOwner = `${config.processId}:${randomUUID()}`;
 
   start(): void {
     if (this.running) return;
@@ -38,10 +44,12 @@ export class Scheduler {
     this.timers.push(setInterval(() => void this.pollLive(), 15_000));
     this.timers.push(setInterval(() => this.enqueueDueDynamicSyncs(), 30_000));
     this.timers.push(setInterval(() => rollOverdueForecasts(), 60_000));
+    this.timers.push(setInterval(() => enqueueJob('cleanup_storage', null, {}, 95, new Date().toISOString(), `cleanup-storage:${new Date().toISOString().slice(0, 10)}`), 6 * 3600_000));
     this.timers.push(setInterval(() => void this.work(), 750));
     void this.pollLive();
     this.enqueueDueDynamicSyncs();
     enqueueJob('repair_dynamic_archives', null, {}, 70, new Date().toISOString(), `repair-dynamics:${new Date().toISOString().slice(0, 10)}`);
+    enqueueJob('cleanup_storage', null, {}, 95, new Date().toISOString(), `cleanup-storage:${new Date().toISOString().slice(0, 10)}`);
     void this.work();
   }
 
@@ -51,19 +59,21 @@ export class Scheduler {
     this.timers = [];
   }
 
-  private enqueueDueDynamicSyncs(): void {
+  enqueueDueDynamicSyncs(): void {
     const rows = getDb().prepare(`SELECT id,dynamic_poll_seconds,last_dynamic_sync_at,last_dynamic_full_sync_at FROM streamers WHERE enabled=1`).all() as Row[];
     const timestamp = Date.now();
     for (const row of rows) {
+      const syncQueued = getDb().prepare(`SELECT 1 FROM jobs WHERE type='sync_streamer' AND entity_id=?
+        AND status IN ('pending','retry','running') LIMIT 1`).get(String(row.id));
+      if (syncQueued) continue;
       const last = row.last_dynamic_sync_at ? new Date(String(row.last_dynamic_sync_at)).getTime() : 0;
-      if (timestamp - last >= Number(row.dynamic_poll_seconds) * 1000) {
-        const bucket = Math.floor(timestamp / (Number(row.dynamic_poll_seconds) * 1000));
-        enqueueJob('sync_streamer', String(row.id), {}, 20, new Date().toISOString(), `periodic-sync:${row.id}:${bucket}`);
-      }
       const fullLast = row.last_dynamic_full_sync_at ? new Date(String(row.last_dynamic_full_sync_at)).getTime() : 0;
       if (timestamp - fullLast >= 24 * 3600_000) {
         const day = Math.floor(timestamp / (24 * 3600_000));
         enqueueJob('sync_streamer', String(row.id), { fullSync: true }, 18, new Date().toISOString(), `daily-full-sync:${row.id}:${day}`);
+      } else if (timestamp - last >= Number(row.dynamic_poll_seconds) * 1000) {
+        const bucket = Math.floor(timestamp / (Number(row.dynamic_poll_seconds) * 1000));
+        enqueueJob('sync_streamer', String(row.id), {}, 20, new Date().toISOString(), `periodic-sync:${row.id}:${bucket}`);
       }
     }
   }
@@ -78,14 +88,14 @@ export class Scheduler {
     if (rows.length === 0) return;
     const cookie = getSecret('bilibili_cookie');
     try {
-      let client = new BilibiliClient(cookie);
+      let client = createBilibiliClient(cookie);
       let states;
       try {
         states = await client.fetchLiveStates(rows.map((row) => ({ roomId: pollRoomId(row), biliUid: String(row.bili_uid) })));
       } catch (error) {
         if (!cookie || !isInvalidCookie(error)) throw error;
         upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', '直播状态抓取已自动回退到匿名模式，请尽快更新 Cookie。');
-        client = new BilibiliClient(null);
+        client = createBilibiliClient(null);
           states = await client.fetchLiveStates(rows.map((row) => ({ roomId: pollRoomId(row), biliUid: String(row.bili_uid) })));
       }
       for (const row of rows) {
@@ -103,15 +113,27 @@ export class Scheduler {
 
   private async work(): Promise<void> {
     if (!this.running || this.workerActive) return;
+    if (!acquireServiceLease('scheduler-worker', 30_000, this.workerLeaseOwner)) return;
     this.workerActive = true;
+    const heartbeat = setInterval(() => {
+      if (this.running) acquireServiceLease('scheduler-worker', 30_000, this.workerLeaseOwner);
+    }, 10_000);
+    heartbeat.unref();
     try {
       while (this.running) {
+        if (!acquireServiceLease('scheduler-worker', 30_000, this.workerLeaseOwner)) break;
         const job = leaseNextJob();
         if (!job) break;
         try {
           await this.execute(job);
           finishJob(String(job.id));
         } catch (error) {
+          if (isPermanentPiResultError(error)) {
+            // Structured model output is deterministic; retrying it only burns tokens.
+            finishJob(String(job.id));
+            upsertAlert(`job-permanent:${job.type}:${job.entity_id}`, 'warning', `Pi 结果需要降级处理：${job.type}`, formatError(error));
+            continue;
+          }
           const delay = backoffDelay(Number(job.attempts), error);
           failJob(String(job.id), error, delay);
           if (Number(job.attempts) >= 3 && String(job.type) !== 'send_alert_email') {
@@ -120,7 +142,9 @@ export class Scheduler {
         }
       }
     } finally {
+      clearInterval(heartbeat);
       this.workerActive = false;
+      releaseServiceLease('scheduler-worker', this.workerLeaseOwner);
     }
   }
 
@@ -132,9 +156,11 @@ export class Scheduler {
       case 'sync_comments': return this.syncComments(String(job.entity_id), payload);
       case 'sync_sub_replies': return this.syncSubReplies(payload);
       case 'download_media': return downloadMediaAsset(String(job.entity_id));
-      case 'pi_analyze': return analyzeStreamerWithPi(String(job.entity_id), payload);
+      case 'pi_analyze': return analyzeStreamerWithPi(String(job.entity_id), { ...payload, attemptNumber: Number(job.attempts) });
+      case 'pi_revision': return analyzeDynamicRevisionWithPi(String(job.entity_id), Number(job.attempts));
       case 'recognize_schedule': return recognizeScheduleDraftWithPi(String(job.entity_id));
       case 'repair_dynamic_archives': return this.repairDynamicArchives();
+      case 'cleanup_storage': await cleanupStorage(); return;
       case 'send_alert_email': return sendAlertEmail(String(job.entity_id));
       case 'validate_cookie': return this.validateCookie();
       default: throw new Error(`未知任务类型：${job.type}`);
@@ -145,7 +171,7 @@ export class Scheduler {
     const cookie = getSecret('bilibili_cookie');
     if (!cookie) return;
     try {
-      const result = await new BilibiliClient(cookie).validateCookie();
+      const result = await createBilibiliClient(cookie).validateCookie();
       if (!result.loggedIn) {
         updateSecretStatus('bilibili_cookie', 'invalid');
         upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', 'Cookie 未登录，抓取任务将自动尝试匿名模式。');
@@ -172,14 +198,14 @@ export class Scheduler {
     const since = new Date();
     since.setMonth(since.getMonth() - 6);
     const cookie = getSecret('bilibili_cookie');
-    let client = new BilibiliClient(cookie);
+    let client = createBilibiliClient(cookie);
     let feed;
     try {
       feed = await client.fetchSpaceDynamics(String(streamer.bili_uid), (initializing || fullSync) ? 1000 : 30, (initializing || fullSync) ? since.toISOString() : undefined);
     } catch (error) {
       if (cookie && isInvalidCookie(error)) {
         upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', '已自动回退到匿名抓取，请尽快在后台更新 Cookie。');
-        client = new BilibiliClient(null);
+        client = createBilibiliClient(null);
         feed = await client.fetchSpaceDynamics(String(streamer.bili_uid), (initializing || fullSync) ? 1000 : 30, (initializing || fullSync) ? since.toISOString() : undefined);
       } else {
         if (error instanceof BilibiliError && (error.status === 412 || error.code === 412)) {
@@ -189,7 +215,10 @@ export class Scheduler {
         throw error;
       }
     }
+    resolveAlert('bilibili-dynamic-rate-limited', 'scheduler');
     const dynamics = feed.items;
+    const newDynamicIds: string[] = [];
+    const revisionIds: Array<{ revisionId: string; dynamicId: string }> = [];
     let detailBudget = (initializing || fullSync) ? Number.POSITIVE_INFINITY : 20;
     let detailsFetched = 0;
     for (const dynamic of dynamics) {
@@ -197,9 +226,9 @@ export class Scheduler {
       let enriched = dynamic;
       const feedLooksChanged = Boolean(existing && (dynamic.text !== existing.text ||
         JSON.stringify([...(dynamic.mediaUrls ?? [])].sort()) !== JSON.stringify(existing.media.map((item) => item.sourceUrl).sort())));
-      if (detailBudget > 0 && (initializing || fullSync || !existing || feedLooksChanged || !String(dynamic.text ?? '').trim() ||
-        !String(existing?.text ?? '').trim() ||
-        (String(existing.text ?? '').includes('[') && Object.keys(existing.emojiMap ?? {}).length === 0))) {
+      if (detailBudget > 0 && (feedLooksChanged || dynamic.detailRequired ||
+        (!String(dynamic.text ?? '').trim() && !hasRenderableDynamicCard(dynamic.rawExcerpt)) ||
+        Boolean(existing && String(existing.text ?? '').includes('[') && Object.keys(existing.emojiMap ?? {}).length === 0))) {
         try {
           // 添加延迟以避免触发B站风控（第一个请求不延迟）
           if (detailsFetched > 0) {
@@ -208,8 +237,9 @@ export class Scheduler {
           const detail = await client.fetchDynamicDetail(dynamic.id);
           enriched = { ...dynamic, text: detail.text || dynamic.text,
             mediaUrls: [...new Set([...(dynamic.mediaUrls ?? []), ...(detail.mediaUrls ?? [])])],
-            emojiMap: detail.emojiMap, commentOid: detail.commentOid ?? dynamic.commentOid, commentType: detail.commentType ?? dynamic.commentType,
-            contentQuality: 'detail', detailFetchedAt: new Date().toISOString() };
+            emojiMap: { ...(dynamic.emojiMap ?? {}), ...(detail.emojiMap ?? {}) }, commentOid: detail.commentOid ?? dynamic.commentOid,
+            commentType: detail.commentType ?? dynamic.commentType,
+            editedAt: detail.editedAt, contentQuality: 'detail', detailFetchedAt: new Date().toISOString() };
           detailsFetched += 1;
         } catch (error) {
           // 只在非412错误时创建告警，避免告警泛滥
@@ -221,7 +251,9 @@ export class Scheduler {
             const archived = (existing.text.trim() || existing.media.length > 0 || Object.keys(existing.emojiMap ?? {}).length > 0)
               ? { text: existing.text, mediaUrls: existing.media.map((item) => item.sourceUrl), emojiMap: existing.emojiMap ?? {} }
               : getLatestCompleteDynamicSnapshot(dynamic.id);
-            if (archived) enriched = { ...dynamic, ...archived, contentQuality: 'restored' };
+            if (archived) enriched = { ...dynamic, text: archived.text || dynamic.text,
+              mediaUrls: [...new Set([...(dynamic.mediaUrls ?? []), ...archived.mediaUrls])],
+              emojiMap: { ...archived.emojiMap, ...(dynamic.emojiMap ?? {}) }, contentQuality: 'restored' };
           }
         }
         detailBudget -= 1;
@@ -229,9 +261,13 @@ export class Scheduler {
         const archived = (existing.text.trim() || existing.media.length > 0 || Object.keys(existing.emojiMap ?? {}).length > 0)
           ? { text: existing.text, mediaUrls: existing.media.map((item) => item.sourceUrl), emojiMap: existing.emojiMap ?? {} }
           : getLatestCompleteDynamicSnapshot(dynamic.id);
-        if (archived) enriched = { ...dynamic, ...archived, contentQuality: 'restored' };
+        if (archived) enriched = { ...dynamic, text: archived.text || dynamic.text,
+          mediaUrls: [...new Set([...(dynamic.mediaUrls ?? []), ...archived.mediaUrls])],
+          emojiMap: { ...archived.emojiMap, ...(dynamic.emojiMap ?? {}) }, contentQuality: 'restored' };
       }
-      upsertDynamic({ ...enriched, streamerId, contentQuality: enriched.contentQuality ?? 'feed' });
+      const stored = upsertDynamic({ ...enriched, streamerId, contentQuality: enriched.contentQuality ?? 'feed' });
+      if (stored.created) newDynamicIds.push(dynamic.id);
+      else if (stored.changed && stored.revisionId) revisionIds.push({ revisionId: stored.revisionId, dynamicId: dynamic.id });
       if (dynamic.avatarUrl) getDb().prepare('UPDATE streamers SET avatar_url=COALESCE(avatar_url,?),updated_at=? WHERE id=?').run(dynamic.avatarUrl, new Date().toISOString(), streamerId);
     }
     if ((initializing || fullSync) && feed.complete) {
@@ -241,6 +277,12 @@ export class Scheduler {
       .run(new Date().toISOString(), new Date().toISOString(), new Date().toISOString(), streamerId);
     getDb().prepare('UPDATE streamers SET last_dynamic_sync_at=?,updated_at=? WHERE id=?')
       .run(new Date().toISOString(), new Date().toISOString(), streamerId);
+    stagePiDynamicIds(streamerId, newDynamicIds);
+    const completedRequestedRange = !(initializing || fullSync) || feed.complete;
+    if (completedRequestedRange) {
+      queuePiDynamicBatch(streamerId, newDynamicIds, initializing, initializing ? 0 : 30_000);
+      for (const revision of revisionIds) queuePiRevisionAnalysis(revision.revisionId, revision.dynamicId, 30_000);
+    }
   }
 
   private async syncComments(dynamicId: string, payload: Row = {}): Promise<void> {
@@ -249,7 +291,7 @@ export class Scheduler {
     if (!dynamic) return;
     const state = getDb().prepare('SELECT * FROM comment_sync_state WHERE dynamic_id=?').get(dynamicId) as Row | undefined;
     const cookie = getSecret('bilibili_cookie');
-    let client = new BilibiliClient(cookie);
+    let client = createBilibiliClient(cookie);
     let anonymousFallback = false;
     const callWithCookieFallback = async <T>(operation: (activeClient: BilibiliClient) => Promise<T>): Promise<T> => {
       try { return await operation(client); }
@@ -257,7 +299,7 @@ export class Scheduler {
         if (!cookie || anonymousFallback || !isInvalidCookie(error)) throw error;
         anonymousFallback = true;
         upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', '评论抓取已自动回退到匿名模式，请尽快更新 Cookie。');
-        client = new BilibiliClient(null);
+        client = createBilibiliClient(null);
         return operation(client);
       }
     };
@@ -307,8 +349,10 @@ export class Scheduler {
   }
 
   private async syncSubReplies(payload: Row): Promise<void> {
+    const dynamicId = String(payload.dynamicId ?? '');
+    if (!dynamicId || !getDynamic(dynamicId)) return;
     const cookie = getSecret('bilibili_cookie');
-    let client = new BilibiliClient(cookie);
+    let client = createBilibiliClient(cookie);
     let anonymousFallback = false;
     const callWithCookieFallback = async <T>(operation: (activeClient: BilibiliClient) => Promise<T>): Promise<T> => {
       try { return await operation(client); }
@@ -316,7 +360,7 @@ export class Scheduler {
         if (!cookie || anonymousFallback || !isInvalidCookie(error)) throw error;
         anonymousFallback = true;
         upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', '楼中楼抓取已自动回退到匿名模式，请尽快更新 Cookie。');
-        client = new BilibiliClient(null);
+        client = createBilibiliClient(null);
         return operation(client);
       }
     };
@@ -328,30 +372,51 @@ export class Scheduler {
       if (page > start) await delay(config.commentPageDelayMs + Math.floor(Math.random() * 500));
       const comments = await callWithCookieFallback((activeClient) => activeClient.fetchSubReplies(String(payload.oid), String(payload.type), String(payload.rootId), page));
       for (const comment of comments) {
-        upsertComment({ ...comment, dynamicId: String(payload.dynamicId), isStreamer: comment.authorUid === String(payload.streamerUid) });
+        upsertComment({ ...comment, dynamicId, isStreamer: comment.authorUid === String(payload.streamerUid) });
         seenIds.push(comment.id);
       }
     }
     if (end < Number(payload.totalPages)) {
       const next = end + 1;
-      enqueueJob('sync_sub_replies', String(payload.dynamicId), { ...payload, startPage: next, fullScan, seenIds: [...new Set(seenIds)] }, 65,
-        new Date(Date.now() + 5000).toISOString(), `sub:${payload.dynamicId}:${payload.rootId}:${payload.scanId}:${next}`);
+      enqueueJob('sync_sub_replies', dynamicId, { ...payload, startPage: next, fullScan, seenIds: [...new Set(seenIds)] }, 65,
+        new Date(Date.now() + 5000).toISOString(), `sub:${dynamicId}:${payload.rootId}:${payload.scanId}:${next}`);
     } else if (fullScan) {
-      markMissingRepliesUnavailable(String(payload.dynamicId), String(payload.rootId), [...new Set(seenIds)]);
+      markMissingRepliesUnavailable(dynamicId, String(payload.rootId), [...new Set(seenIds)]);
     }
   }
 
   private async refreshDynamic(dynamicId: string): Promise<void> {
-    const row = getDb().prepare('SELECT streamer_id FROM dynamics WHERE id=?').get(dynamicId) as Row | undefined;
+    const row = getDb().prepare(`SELECT d.streamer_id,d.published_at,s.bili_uid FROM dynamics d
+      JOIN streamers s ON s.id=d.streamer_id WHERE d.id=?`).get(dynamicId) as Row | undefined;
     if (!row) return;
     const cookie = getSecret('bilibili_cookie');
+    const client = createBilibiliClient(cookie);
+    let feedDynamic: Awaited<ReturnType<BilibiliClient['fetchSpaceDynamics']>>['items'][number] | null = null;
     try {
-      const detail = await new BilibiliClient(cookie).fetchDynamicDetail(dynamicId);
+      const cutoff = new Date(new Date(String(row.published_at)).getTime() - 1000).toISOString();
+      const feed = await client.fetchSpaceDynamics(String(row.bili_uid), 1000, cutoff);
+      feedDynamic = feed.items.find((item) => item.id === dynamicId) ?? null;
+    } catch {
+      // The detail endpoint remains an independent fallback when the space feed is rate limited.
+    }
+    try {
+      const detail = await client.fetchDynamicDetail(dynamicId);
       const current = getDb().prepare('SELECT * FROM dynamics WHERE id=?').get(dynamicId) as Row;
-      upsertDynamic({ id: dynamicId, streamerId: String(row.streamer_id), type: String(current.type), text: detail.text, sourceUrl: String(current.source_url),
-        publishedAt: String(current.published_at), commentOid: detail.commentOid, commentType: detail.commentType, commentCount: Number(current.comment_count), likeCount: Number(current.like_count),
-        mediaUrls: detail.mediaUrls, emojiMap: detail.emojiMap, contentQuality: 'detail', detailFetchedAt: new Date().toISOString() });
+      const stored = upsertDynamic({ ...(feedDynamic ?? {}), id: dynamicId, streamerId: String(row.streamer_id), type: feedDynamic?.type ?? String(current.type),
+        text: detail.text || feedDynamic?.text || '', sourceUrl: feedDynamic?.sourceUrl ?? String(current.source_url),
+        publishedAt: feedDynamic?.publishedAt ?? String(current.published_at), commentOid: detail.commentOid ?? feedDynamic?.commentOid,
+        commentType: detail.commentType ?? feedDynamic?.commentType, commentCount: feedDynamic?.commentCount ?? Number(current.comment_count),
+        likeCount: feedDynamic?.likeCount ?? Number(current.like_count),
+        mediaUrls: [...new Set([...(feedDynamic?.mediaUrls ?? []), ...(detail.mediaUrls ?? [])])],
+        emojiMap: { ...(feedDynamic?.emojiMap ?? {}), ...detail.emojiMap },
+        rawExcerpt: feedDynamic?.rawExcerpt, editedAt: detail.editedAt, contentQuality: 'detail', detailFetchedAt: new Date().toISOString() });
+      if (stored.changed && stored.revisionId) queuePiRevisionAnalysis(stored.revisionId, dynamicId, 0);
     } catch (error) {
+      if (feedDynamic) {
+        const stored = upsertDynamic({ ...feedDynamic, streamerId: String(row.streamer_id), contentQuality: 'feed' });
+        if (stored.changed && stored.revisionId) queuePiRevisionAnalysis(stored.revisionId, dynamicId, 0);
+        return;
+      }
       if (error instanceof BilibiliError && [404, 410].includes(Number(error.status))) {
         const current = getDb().prepare('SELECT * FROM dynamics WHERE id=?').get(dynamicId) as Row;
         const archived = getLatestCompleteDynamicSnapshot(dynamicId);
@@ -392,7 +457,16 @@ function nextCommentSyncTime(publishedAt: string): string {
 
 function backoffDelay(attempt: number, error: unknown): number {
   if (error instanceof BilibiliError && (error.code === 412 || error.status === 412 || error.code === 429)) return 60 * 60_000;
+  if (error instanceof Error && error.name === 'PiLeaseBusyError') return 30_000;
+  if (error instanceof Error && error.name === 'PiRevisionMediaPendingError') return 15_000;
+  if (error instanceof Error && /\b(429|503)\b|rate.?limit|No available accounts/i.test(error.message)) return Math.min(30 * 60_000, 30_000 * 2 ** Math.min(attempt - 1, 6));
   return Math.min(60 * 60_000, Math.max(5000, 2 ** Math.min(attempt, 10) * 1000));
+}
+
+function isPermanentPiResultError(error: unknown): boolean {
+  const message = formatError(error);
+  return /预测时间必须是未来时间|编辑分析试图停用不属于该动态的事件|非取消编辑事件必须包含时间|模型未提交结构化动态编辑分析/i.test(message)
+    || /^400 \{"model":"deepseek-v4-flash-vision-exp"\}/i.test(message);
 }
 
 function isInvalidCookie(error: unknown): boolean {
@@ -401,6 +475,10 @@ function isInvalidCookie(error: unknown): boolean {
 
 function pollRoomId(row: Row): string {
   return row.room_mapping_status === 'verified' && row.resolved_room_id ? String(row.resolved_room_id) : String(row.room_id);
+}
+
+function hasRenderableDynamicCard(rawExcerpt: string | null | undefined): boolean {
+  return Boolean(safeJson(String(rawExcerpt ?? '{}')).card);
 }
 
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
