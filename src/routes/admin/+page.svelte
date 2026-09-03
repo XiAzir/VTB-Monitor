@@ -127,7 +127,7 @@
               <div class="field"><label for="confirm-password">再次输入</label><input id="confirm-password" name="confirm" type="password" minlength="10" autocomplete="new-password" required /></div>
               <button class="button primary" type="submit">更新密码</button></form>
             <form class="panel form-panel" method="POST" action="?/saveCookie"><div class="form-title"><Radio size={17} /><strong>B站 Cookie</strong></div>
-              <p class="form-help">失效时自动回退匿名抓取并发送告警。</p><div class="field"><label for="cookie">替换 Cookie</label><textarea id="cookie" name="cookie" autocomplete="off" required></textarea></div>
+              <p class="form-help">单个 Cookie 直接填写；多个 Cookie 请用空行分隔，系统会轮询使用。失效时自动回退匿名抓取并发送告警。</p><div class="field"><label for="cookie">替换 Cookie</label><textarea id="cookie" name="cookie" autocomplete="off" required></textarea></div>
               <button class="button primary" type="submit">加密保存并验证</button></form>
             <form class="panel form-panel" method="POST" action="?/saveBilibiliProxy"><div class="form-title"><ServerCog size={17} /><strong>B站请求代理</strong></div>
               <p class="form-help">仅用于 B站 API、动态详情和直播状态请求；留空使用直连。</p>

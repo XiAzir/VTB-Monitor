@@ -12,6 +12,7 @@ import {
 import { sendAlertEmail } from './alerts';
 import { analyzeDynamicRevisionWithPi, analyzeStreamerWithPi, recognizeScheduleDraftWithPi } from './pi';
 import { cleanupStorage } from './storage-maintenance';
+import { getBilibiliCookie } from './bilibili-cookie-pool';
 
 type Row = Record<string, any>;
 
@@ -86,7 +87,7 @@ export class Scheduler {
     const rows = candidates.filter((row) => !row.checked_at ||
       timestamp - new Date(String(row.checked_at)).getTime() >= Number(row.live_poll_seconds) * 1000);
     if (rows.length === 0) return;
-    const cookie = getSecret('bilibili_cookie');
+    const cookie = getBilibiliCookie();
     try {
       let client = createBilibiliClient(cookie);
       let states;
@@ -168,7 +169,7 @@ export class Scheduler {
   }
 
   private async validateCookie(): Promise<void> {
-    const cookie = getSecret('bilibili_cookie');
+    const cookie = getBilibiliCookie();
     if (!cookie) return;
     try {
       const result = await createBilibiliClient(cookie).validateCookie();
@@ -197,7 +198,7 @@ export class Scheduler {
     const initializing = !streamer.dynamic_history_initialized_at;
     const since = new Date();
     since.setMonth(since.getMonth() - 6);
-    const cookie = getSecret('bilibili_cookie');
+    const cookie = getBilibiliCookie();
     let client = createBilibiliClient(cookie);
     let feed;
     try {
@@ -290,7 +291,7 @@ export class Scheduler {
       .get(dynamicId) as Row | undefined;
     if (!dynamic) return;
     const state = getDb().prepare('SELECT * FROM comment_sync_state WHERE dynamic_id=?').get(dynamicId) as Row | undefined;
-    const cookie = getSecret('bilibili_cookie');
+    const cookie = getBilibiliCookie();
     let client = createBilibiliClient(cookie);
     let anonymousFallback = false;
     const callWithCookieFallback = async <T>(operation: (activeClient: BilibiliClient) => Promise<T>): Promise<T> => {
@@ -351,7 +352,7 @@ export class Scheduler {
   private async syncSubReplies(payload: Row): Promise<void> {
     const dynamicId = String(payload.dynamicId ?? '');
     if (!dynamicId || !getDynamic(dynamicId)) return;
-    const cookie = getSecret('bilibili_cookie');
+    const cookie = getBilibiliCookie();
     let client = createBilibiliClient(cookie);
     let anonymousFallback = false;
     const callWithCookieFallback = async <T>(operation: (activeClient: BilibiliClient) => Promise<T>): Promise<T> => {
@@ -389,7 +390,7 @@ export class Scheduler {
     const row = getDb().prepare(`SELECT d.streamer_id,d.published_at,s.bili_uid FROM dynamics d
       JOIN streamers s ON s.id=d.streamer_id WHERE d.id=?`).get(dynamicId) as Row | undefined;
     if (!row) return;
-    const cookie = getSecret('bilibili_cookie');
+    const cookie = getBilibiliCookie();
     const client = createBilibiliClient(cookie);
     let feedDynamic: Awaited<ReturnType<BilibiliClient['fetchSpaceDynamics']>>['items'][number] | null = null;
     try {

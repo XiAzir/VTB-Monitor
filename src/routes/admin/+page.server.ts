@@ -8,6 +8,8 @@ import {
 } from '$lib/server/store';
 import { verifyPassword } from '$lib/server/security';
 import type { PiProfile } from '$lib/server/pi';
+import { createHash } from 'node:crypto';
+import { bilibiliCookiePoolKey } from '$lib/server/bilibili-cookie-pool';
 
 interface SmtpSettings {
   host: string;
@@ -119,11 +121,20 @@ export const actions: Actions = {
   saveCookie: async ({ request, locals }) => {
     requireAdmin(locals.adminSession);
     const form = await request.formData();
-    const cookie = String(form.get('cookie') ?? '').trim();
-    if (!cookie) return fail(400, { formError: 'Cookie 不能为空' });
-    putSecret('bilibili_cookie', cookie, `admin:${locals.adminSession!.adminId}`);
+    const cookieInput = String(form.get('cookie') ?? '').trim();
+    if (!cookieInput) return fail(400, { formError: 'Cookie 不能为空' });
+    const cookies = cookieInput.split(/\r?\n\s*\r?\n/).map((value) => value.trim()).filter(Boolean);
+    const actor = `admin:${locals.adminSession!.adminId}`;
+    if (cookies.length === 1) {
+      putSecret('bilibili_cookie', cookies[0], actor);
+    } else {
+      for (const cookie of cookies) {
+        const id = createHash('sha256').update(cookie).digest('hex').slice(0, 12);
+        putSecret(bilibiliCookiePoolKey(id), cookie, actor);
+      }
+    }
     enqueueJob('validate_cookie', null, {}, 1, new Date().toISOString(), `validate-cookie:${Date.now()}`);
-    return { saved: 'B站 Cookie 已加密保存' };
+    return { saved: cookies.length > 1 ? `已加密保存 ${cookies.length} 个 B站 Cookie` : 'B站 Cookie 已加密保存' };
   },
   saveBilibiliProxy: async ({ request, locals }) => {
     requireAdmin(locals.adminSession);
