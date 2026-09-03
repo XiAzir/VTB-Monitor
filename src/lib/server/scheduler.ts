@@ -4,7 +4,7 @@ import { config } from './config';
 import { getDb } from './db';
 import { downloadMediaAsset } from './media';
 import {
-  acquireServiceLease, enqueueJob, failJob, finishJob, getDynamic, getLatestCompleteDynamicSnapshot, getSecret, getSetting, leaseNextJob, releaseServiceLease, rollOverdueForecasts,
+  acquireServiceLease, enqueueJob, failJob, finishJob, getDynamic, getLatestCompleteDynamicSnapshot, getSecret, getSetting, listSecretMetadata, leaseNextJob, releaseServiceLease, rollOverdueForecasts,
   markMissingRepliesUnavailable, markMissingRootCommentsUnavailable,
   resolveAlert, updateLiveState, updateRoomMapping, updateSecretStatus, upsertAlert, upsertComment, upsertDynamic,
   markDynamicDeleted, markMissingDynamicsDeleted, queuePiDynamicBatch, queuePiRevisionAnalysis, stagePiDynamicIds
@@ -12,7 +12,7 @@ import {
 import { sendAlertEmail } from './alerts';
 import { analyzeDynamicRevisionWithPi, analyzeStreamerWithPi, recognizeScheduleDraftWithPi } from './pi';
 import { cleanupStorage } from './storage-maintenance';
-import { getBilibiliCookie } from './bilibili-cookie-pool';
+import { getBilibiliCookie, markBilibiliCookieFailure } from './bilibili-cookie-pool';
 
 type Row = Record<string, any>;
 
@@ -94,6 +94,7 @@ export class Scheduler {
       try {
         states = await client.fetchLiveStates(rows.map((row) => ({ roomId: pollRoomId(row), biliUid: String(row.bili_uid) })));
       } catch (error) {
+        markBilibiliCookieFailure(cookie, error);
         if (!cookie || !isInvalidCookie(error)) throw error;
         upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', '直播状态抓取已自动回退到匿名模式，请尽快更新 Cookie。');
         client = createBilibiliClient(null);
@@ -169,25 +170,24 @@ export class Scheduler {
   }
 
   private async validateCookie(): Promise<void> {
-    const cookie = getBilibiliCookie();
-    if (!cookie) return;
-    try {
-      const result = await createBilibiliClient(cookie).validateCookie();
-      if (!result.loggedIn) {
-        updateSecretStatus('bilibili_cookie', 'invalid');
-        upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', 'Cookie 未登录，抓取任务将自动尝试匿名模式。');
-        return;
+    const poolKeys = listSecretMetadata().filter((row) => String(row.key).startsWith('bilibili_cookie_pool:')).map((row) => String(row.key));
+    const keys = poolKeys.length ? poolKeys : ['bilibili_cookie'];
+    let validCount = 0;
+    for (const key of keys) {
+      const cookie = getSecret(key);
+      if (!cookie) continue;
+      try {
+        const result = await createBilibiliClient(cookie).validateCookie();
+        if (result.loggedIn) { updateSecretStatus(key, 'valid'); validCount += 1; }
+        else updateSecretStatus(key, 'invalid');
+      } catch (error) {
+        markBilibiliCookieFailure(cookie, error);
+        if (isInvalidCookie(error)) updateSecretStatus(key, 'invalid');
+        else throw error;
       }
-      updateSecretStatus('bilibili_cookie', 'valid');
-      resolveAlert('bilibili-cookie-invalid', 'scheduler');
-    } catch (error) {
-      if (isInvalidCookie(error)) {
-        updateSecretStatus('bilibili_cookie', 'invalid');
-        upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', 'Cookie 返回 -101，抓取任务将自动尝试匿名模式。');
-        return;
-      }
-      throw error;
     }
+    if (validCount > 0) resolveAlert('bilibili-cookie-invalid', 'scheduler');
+    else upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', 'Cookie 池中没有可用的登录 Cookie，抓取任务将自动尝试匿名模式。');
   }
 
   private async syncStreamer(streamerId: string, payload: Row = {}): Promise<void> {
@@ -204,6 +204,7 @@ export class Scheduler {
     try {
       feed = await client.fetchSpaceDynamics(String(streamer.bili_uid), (initializing || fullSync) ? 1000 : 30, (initializing || fullSync) ? since.toISOString() : undefined);
     } catch (error) {
+      markBilibiliCookieFailure(cookie, error);
       if (cookie && isInvalidCookie(error)) {
         upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', '已自动回退到匿名抓取，请尽快在后台更新 Cookie。');
         client = createBilibiliClient(null);
@@ -297,6 +298,7 @@ export class Scheduler {
     const callWithCookieFallback = async <T>(operation: (activeClient: BilibiliClient) => Promise<T>): Promise<T> => {
       try { return await operation(client); }
       catch (error) {
+        markBilibiliCookieFailure(cookie, error);
         if (!cookie || anonymousFallback || !isInvalidCookie(error)) throw error;
         anonymousFallback = true;
         upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', '评论抓取已自动回退到匿名模式，请尽快更新 Cookie。');
@@ -358,6 +360,7 @@ export class Scheduler {
     const callWithCookieFallback = async <T>(operation: (activeClient: BilibiliClient) => Promise<T>): Promise<T> => {
       try { return await operation(client); }
       catch (error) {
+        markBilibiliCookieFailure(cookie, error);
         if (!cookie || anonymousFallback || !isInvalidCookie(error)) throw error;
         anonymousFallback = true;
         upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', '楼中楼抓取已自动回退到匿名模式，请尽快更新 Cookie。');
@@ -397,7 +400,8 @@ export class Scheduler {
       const cutoff = new Date(new Date(String(row.published_at)).getTime() - 1000).toISOString();
       const feed = await client.fetchSpaceDynamics(String(row.bili_uid), 1000, cutoff);
       feedDynamic = feed.items.find((item) => item.id === dynamicId) ?? null;
-    } catch {
+    } catch (error) {
+      markBilibiliCookieFailure(cookie, error);
       // The detail endpoint remains an independent fallback when the space feed is rate limited.
     }
     try {
@@ -413,6 +417,7 @@ export class Scheduler {
         rawExcerpt: feedDynamic?.rawExcerpt, editedAt: detail.editedAt, contentQuality: 'detail', detailFetchedAt: new Date().toISOString() });
       if (stored.changed && stored.revisionId) queuePiRevisionAnalysis(stored.revisionId, dynamicId, 0);
     } catch (error) {
+      markBilibiliCookieFailure(cookie, error);
       if (feedDynamic) {
         const stored = upsertDynamic({ ...feedDynamic, streamerId: String(row.streamer_id), contentQuality: 'feed' });
         if (stored.changed && stored.revisionId) queuePiRevisionAnalysis(stored.revisionId, dynamicId, 0);
