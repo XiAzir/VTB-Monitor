@@ -369,13 +369,52 @@ export class PiRevisionMediaPendingError extends Error {
   constructor() { super('等待动态修订图片完成本地归档'); this.name = 'PiRevisionMediaPendingError'; }
 }
 
-export async function runAdminPiPrompt(prompt: string, onText?: (text: string) => void): Promise<string> {
+export interface AdminPiConversationSummary {
+  id: string;
+  title: string;
+  updatedAt: string;
+}
+
+export interface AdminPiDisplayMessage {
+  role: 'user' | 'assistant';
+  text: string;
+  createdAt: string;
+}
+
+export function listAdminPiConversations(adminId: string): AdminPiConversationSummary[] {
+  const prefix = `admin_v2:${adminId}:`;
+  const rows = getDb().prepare(`SELECT kind,title,updated_at FROM pi_conversations
+    WHERE streamer_id IS NULL AND kind LIKE ? ORDER BY updated_at DESC LIMIT 50`).all(`${prefix}%`) as Row[];
+  return rows.map((row) => ({ id: String(row.kind).slice(prefix.length), title: String(row.title), updatedAt: String(row.updated_at) }));
+}
+
+export function getAdminPiConversation(adminId: string, conversationId: string): AdminPiDisplayMessage[] | null {
+  const conversation = getDb().prepare('SELECT id FROM pi_conversations WHERE streamer_id IS NULL AND kind=?')
+    .get(`admin_v2:${adminId}:${conversationId}`) as Row | undefined;
+  if (!conversation) return null;
+  const rows = getDb().prepare(`SELECT role,content_json,created_at FROM pi_messages WHERE conversation_id=?
+    AND role IN ('user','assistant') ORDER BY created_at,id LIMIT 200`).all(String(conversation.id)) as Row[];
+  return rows.flatMap((row) => {
+    try {
+      const message = JSON.parse(String(row.content_json)) as Row;
+      const text = typeof message.content === 'string' ? message.content
+        : Array.isArray(message.content) ? message.content
+          .filter((block: Row) => block?.type === 'text' && typeof block.text === 'string')
+          .map((block: Row) => String(block.text)).join('') : '';
+      const role = String(row.role);
+      return text && (role === 'user' || role === 'assistant')
+        ? [{ role, text, createdAt: String(row.created_at) } as AdminPiDisplayMessage] : [];
+    } catch { return []; }
+  });
+}
+
+export async function runAdminPiPrompt(prompt: string, conversationKey: string, onText?: (text: string) => void, signal?: AbortSignal): Promise<string> {
   if (activeRuns > 0) throw new Error('Pi 正在分析主播，请稍后重试');
   const profile = getSetting<PiProfile>('pi_profile', DEFAULT_PROFILE);
   const apiKey = getSecret(profile.apiKeySecret ?? 'pi_api_key');
   if (!apiKey) throw new Error('Pi API Key 尚未配置');
   const { models, model } = createPiModel(profile);
-  const conversationId = ensureConversation(null, 'admin', '后台管理助手');
+  const conversationId = ensureConversation(null, conversationKey, prompt.slice(0, 36));
   const tools = createAdminTools(conversationId);
   let output = '';
   const agent = new Agent({
@@ -383,11 +422,13 @@ export async function runAdminPiPrompt(prompt: string, onText?: (text: string) =
       // Keep the admin context bounded; tool-call history from older turns is not
       // needed for the next request and can be rejected by compatible providers.
       messages: loadConversationMessages(conversationId, 8) },
-    streamFn: models.streamSimple.bind(models), getApiKey: () => apiKey, sessionId: `admin-${conversationId}`, toolExecution: 'sequential',
+    streamFn: models.streamSimple.bind(models), getApiKey: () => apiKey, sessionId: conversationKey, toolExecution: 'sequential',
     beforeToolCall: async ({ toolCall }) => {
       if (!tools.some((tool) => tool.name === toolCall.name)) return { block: true, reason: '工具不在后台白名单中', terminate: true };
     }
   });
+  const abort = () => agent.abort();
+  signal?.addEventListener('abort', abort, { once: true });
   agent.subscribe((agentEvent) => {
     const eventAny = agentEvent as any;
     if (eventAny.type === 'message_update' && eventAny.assistantMessageEvent?.type === 'text_delta') {
@@ -397,9 +438,14 @@ export async function runAdminPiPrompt(prompt: string, onText?: (text: string) =
     }
     if (eventAny.type === 'message_end') persistMessage(conversationId, eventAny.message);
   });
-  await agent.prompt(prompt);
-  markPiConnectionValid(profile);
-  return output;
+  try {
+    if (signal?.aborted) throw signal.reason ?? new DOMException('请求已取消', 'AbortError');
+    await agent.prompt(prompt);
+    markPiConnectionValid(profile);
+    return output;
+  } finally {
+    signal?.removeEventListener('abort', abort);
+  }
 }
 
 export function getPiStatus(): { configured: boolean; profile: PiProfile; activeRuns: number } {
@@ -626,6 +672,7 @@ function buildRevisionSystemPrompt(): string {
 
 function buildAdminSystemPrompt(): string {
   return `你是“监控室老大爷”的后台管理 Pi。你可以读取主播状态、修改非密钥业务配置，并触发受限同步或分析任务。
+只处理最新一条用户消息；历史消息仅用于理解指代，不得把旧的未完成请求自动合并进当前任务。涉及主播时必须核对用户本轮提到的名称，名称或目标不明确时先调用 list_streamers 核实。
 不得请求或泄露 Cookie、API Key、SMTP 密码，不得声称执行了未提供的 Shell、SQL、文件或任意网络操作。所有修改会自动生效，调用工具前核对 ID 和版本。`;
 }
 
