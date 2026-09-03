@@ -23,8 +23,10 @@ export function getBilibiliCookie(): string | null {
 /** Marks the pool entry which produced an API error without exposing its value. */
 export function markBilibiliCookieFailure(cookie: string | null, error: unknown): void {
   if (!cookie) return;
-  const isInvalid = error instanceof Error && /(?:^|\D)(-101|-352)(?:\D|$)/.test(error.message);
-  const isRateLimited = error instanceof Error && /(?:412|429)|rate.?limit/i.test(error.message);
+  const code = typeof error === 'object' && error !== null && 'code' in error ? Number((error as { code?: unknown }).code) : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  const isInvalid = code === -101 || code === -352 || /(?:^|\D)(-101|-352)(?:\D|$)/.test(message);
+  const isRateLimited = code === 412 || code === 429 || /(?:412|429)|rate.?limit/i.test(message);
   if (!isInvalid && !isRateLimited) return;
   for (const row of listSecretMetadata().filter((entry) => String(entry.key).startsWith(PREFIX))) {
     const key = String(row.key);
