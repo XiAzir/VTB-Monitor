@@ -4,7 +4,7 @@ import { getPiStatus } from '$lib/server/pi';
 import {
   acknowledgeAlert, acknowledgeAllAlerts, changeAdminPassword, createAdminSession, createApiToken, createStreamer, deleteAdminSession, enqueueJob,
   findAdminByUsername, getDashboardStats, getSetting, listAdminStreamers, listAlerts, listApiTokens,
-  listAudit, listJobs, listSecretMetadata, putSecret, queuePiManualAnalysis, replaceManualScheduleRules, revokeApiToken, setForecast, setSetting, updateStreamer
+  deleteSecret, listAudit, listJobs, listSecretMetadata, putSecret, queuePiManualAnalysis, replaceManualScheduleRules, revokeApiToken, setForecast, setSetting, updateStreamer
 } from '$lib/server/store';
 import { verifyPassword } from '$lib/server/security';
 import type { PiProfile } from '$lib/server/pi';
@@ -135,6 +135,13 @@ export const actions: Actions = {
     }
     enqueueJob('validate_cookie', null, {}, 1, new Date().toISOString(), `validate-cookie:${Date.now()}`);
     return { saved: cookies.length > 1 ? `已加密保存 ${cookies.length} 个 B站 Cookie` : 'B站 Cookie 已加密保存' };
+  },
+  deleteCookie: async ({ request, locals }) => {
+    requireAdmin(locals.adminSession);
+    const key = String((await request.formData()).get('key') ?? '').trim();
+    if (!key.startsWith('bilibili_cookie_pool:')) return fail(400, { formError: '只能删除 Cookie 池条目' });
+    deleteSecret(key, `admin:${locals.adminSession!.adminId}`);
+    return { saved: 'Cookie 池条目已删除' };
   },
   saveBilibiliProxy: async ({ request, locals }) => {
     requireAdmin(locals.adminSession);

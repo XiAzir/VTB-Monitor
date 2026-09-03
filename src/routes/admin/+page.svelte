@@ -129,6 +129,15 @@
             <form class="panel form-panel" method="POST" action="?/saveCookie"><div class="form-title"><Radio size={17} /><strong>B站 Cookie</strong></div>
               <p class="form-help">单个 Cookie 直接填写；多个 Cookie 请用空行分隔，系统会轮询使用。失效时自动回退匿名抓取并发送告警。</p><div class="field"><label for="cookie">替换 Cookie</label><textarea id="cookie" name="cookie" autocomplete="off" required></textarea></div>
               <button class="button primary" type="submit">加密保存并验证</button></form>
+            {#if data.secrets.some((secret) => String(secret.key).startsWith('bilibili_cookie_pool:'))}
+              <div class="panel form-panel"><div class="form-title"><Radio size={17} /><strong>Cookie 池条目</strong></div>
+                {#each data.secrets.filter((secret) => String(secret.key).startsWith('bilibili_cookie_pool:')) as secret}
+                  <div class="list-row"><div><strong>{String(secret.key).replace('bilibili_cookie_pool:', '')}</strong><small>{statusLabel(secret.status)} · {relativeTime(String(secret.updated_at ?? ''))}</small></div>
+                    <form method="POST" action="?/deleteCookie"><input type="hidden" name="key" value={String(secret.key)} /><button class="button danger small" type="submit">删除</button></form>
+                  </div>
+                {/each}
+              </div>
+            {/if}
             <form class="panel form-panel" method="POST" action="?/saveBilibiliProxy"><div class="form-title"><ServerCog size={17} /><strong>B站请求代理</strong></div>
               <p class="form-help">仅用于 B站 API、动态详情和直播状态请求；留空使用直连。</p>
               <div class="field"><label for="bilibili-proxy">HTTP(S) 代理 URL</label><input id="bilibili-proxy" name="proxyUrl" value={data.bilibiliProxyUrl || ''} placeholder="http://127.0.0.1:7890" /></div>

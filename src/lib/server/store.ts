@@ -828,6 +828,16 @@ export function updateSecretStatus(key: string, status: 'valid' | 'invalid' | 'u
     .run(status, now(), now(), key);
 }
 
+export function deleteSecret(key: string, actor = 'admin-ui'): void {
+  if (!key || key === 'bilibili_cookie') throw new Error('不允许删除默认 B站 Cookie');
+  const before = getDb().prepare('SELECT key,status,updated_at FROM secrets WHERE key=?').get(key) as Row | undefined;
+  if (!before) return;
+  withTransaction((db) => {
+    db.prepare('DELETE FROM secrets WHERE key=?').run(key);
+    insertAudit(db, actor, null, 'secret.delete', 'secret', key, before, { key });
+  });
+}
+
 export function setSetting(key: string, value: unknown, actor = 'admin-ui'): void {
   const before = getDb().prepare('SELECT * FROM settings WHERE key=?').get(key) as Row | undefined;
   withTransaction((db) => {
