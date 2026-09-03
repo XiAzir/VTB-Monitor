@@ -6,7 +6,7 @@ import { startScheduler, stopScheduler } from '$lib/server/scheduler';
 export const init: ServerInit = async () => {
   if (building) return;
   await ensureInitialAdmin();
-  startScheduler();
+  if (process.env.DISABLE_SCHEDULER !== '1') startScheduler();
 };
 
 if (import.meta.hot) import.meta.hot.dispose(() => stopScheduler());
