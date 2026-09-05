@@ -61,18 +61,13 @@ export const GET: RequestHandler = async ({ params }) => {
     if (contentLength > MAX_PROXY_BYTES) throw error(413, 'Image is too large');
     const cacheControl = response.headers.get('cache-control') || 'public, max-age=31536000';
 
-    let streamedBytes = 0;
-    const limitedBody = response.body?.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
-        streamedBytes += chunk.byteLength;
-        if (streamedBytes > MAX_PROXY_BYTES) throw new Error('Image exceeded proxy limit');
-        controller.enqueue(chunk);
-      }
-    }));
-    return new Response(limitedBody, {
+    const body = await response.arrayBuffer();
+    if (body.byteLength > MAX_PROXY_BYTES) throw error(413, 'Image is too large');
+    return new Response(body, {
       status: 200,
       headers: {
         'Content-Type': contentType,
+        'Content-Length': String(body.byteLength),
         'Cache-Control': cacheControl
       }
     });

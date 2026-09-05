@@ -13,7 +13,7 @@ export const POST: RequestHandler = async (event) => dispatch(event, 'POST');
 export const PATCH: RequestHandler = async (event) => dispatch(event, 'PATCH');
 
 async function dispatch(event: Parameters<RequestHandler>[0], method: string): Promise<Response> {
-  if (event.request.headers.get('x-vtbm-management-listener') !== 'internal-v1') error(404, 'Not found');
+  if (event.request.headers.get('x-vtbm-management-listener') !== 'internal-v1' || !isLoopbackAddress(event.getClientAddress())) error(404, 'Not found');
   const path = `/${event.params.path ?? ''}`.replace(/\/+$/, '') || '/';
   if (path === '/healthz' && method === 'GET') return json({ status: 'ok', time: new Date().toISOString() });
   if (path === '/openapi.json' && method === 'GET') return json(openApiDocument());
@@ -40,7 +40,7 @@ async function dispatch(event: Parameters<RequestHandler>[0], method: string): P
   if (method === 'POST' && path === '/streamers') {
     requireScope(token, 'config:write');
     return idempotent(event.request, token, path, async () => {
-      const body = await event.request.json();
+      const body = await parseJsonBody(event.request) as Parameters<typeof createStreamer>[0];
       const id = createStreamer(body, `api-token:${token.id}`);
       return { status: 201, body: { id } };
     });
@@ -49,7 +49,7 @@ async function dispatch(event: Parameters<RequestHandler>[0], method: string): P
   if (method === 'PATCH' && streamerPatch) {
     requireScope(token, 'config:write');
     return idempotent(event.request, token, path, async () => {
-      const body = await event.request.json() as Record<string, unknown>;
+      const body = await parseJsonBody(event.request) as Record<string, unknown>;
       const version = Number(body.version);
       const { version: _, ...changes } = body;
       updateStreamer(streamerPatch[1], changes, version, `api-token:${token.id}`);
@@ -80,7 +80,7 @@ async function dispatch(event: Parameters<RequestHandler>[0], method: string): P
   if (method === 'POST' && secretWrite) {
     requireScope(token, 'secrets:write');
     return idempotent(event.request, token, path, async () => {
-      const body = await event.request.json() as { value?: string };
+      const body = await parseJsonBody(event.request) as { value?: string };
       if (!body.value) error(400, 'value is required');
       putSecret(decodeURIComponent(secretWrite[1]), body.value, `api-token:${token.id}`);
       return { status: 200, body: { updated: true } };
@@ -108,26 +108,51 @@ function requireScope(token: Token, scope: string): void {
   if (!token.scopes.includes(scope)) error(403, `Missing scope: ${scope}`);
 }
 
+const MAX_REQUEST_BYTES = 1024 * 1024;
+
+function parseJsonBody(request: Request): Promise<unknown> {
+  const declared = Number(request.headers.get('content-length') ?? 0);
+  if (declared > MAX_REQUEST_BYTES) error(413, 'Request body is too large');
+  return request.text().then((text) => {
+    if (Buffer.byteLength(text, 'utf8') > MAX_REQUEST_BYTES) error(413, 'Request body is too large');
+    try { return JSON.parse(text); } catch { error(400, 'Invalid JSON'); }
+  });
+}
+
 async function idempotent(request: Request, token: Token, path: string,
   work: () => Promise<{ status: number; body: unknown }>): Promise<Response> {
   const key = request.headers.get('idempotency-key');
   if (!key || key.length > 200) error(400, 'Idempotency-Key is required');
   const storedKey = `${token.id}:${key}`;
   const db = getDb();
-  db.prepare('DELETE FROM idempotency_keys WHERE expires_at < ?').run(new Date().toISOString());
+  const now = new Date().toISOString();
+  db.prepare('DELETE FROM idempotency_keys WHERE expires_at < ?').run(now);
   const existing = db.prepare('SELECT * FROM idempotency_keys WHERE key=?').get(storedKey) as Record<string, unknown> | undefined;
   if (existing) {
     if (existing.method !== request.method || existing.path !== path) error(409, 'Idempotency-Key was already used for another operation');
+    if (Number(existing.response_status) === 0) error(409, 'The same operation is already in progress');
     return json(JSON.parse(String(existing.response_json)), { status: Number(existing.response_status) });
   }
-  const result = await work();
-  db.prepare(`INSERT INTO idempotency_keys(key,actor_id,method,path,response_status,response_json,expires_at,created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(storedKey, token.id, request.method, path, result.status, JSON.stringify(result.body),
-      new Date(Date.now() + 24 * 3600_000).toISOString(), new Date().toISOString());
-  return json(result.body, { status: result.status });
+  try {
+    db.prepare(`INSERT INTO idempotency_keys(key,actor_id,method,path,response_status,response_json,expires_at,created_at)
+      VALUES (?, ?, ?, ?, 0, ?, ?, ?)`)
+      .run(storedKey, token.id, request.method, path, JSON.stringify({ processing: true }),
+        new Date(Date.now() + 24 * 3600_000).toISOString(), now);
+  } catch (reason) {
+    const raced = db.prepare('SELECT * FROM idempotency_keys WHERE key=?').get(storedKey) as Record<string, unknown> | undefined;
+    if (raced && raced.method === request.method && raced.path === path) error(409, 'The same operation is already in progress');
+    throw reason;
+  }
+  try {
+    const result = await work();
+    db.prepare('UPDATE idempotency_keys SET response_status=?,response_json=? WHERE key=?')
+      .run(result.status, JSON.stringify(result.body), storedKey);
+    return json(result.body, { status: result.status });
+  } catch (reason) {
+    db.prepare('DELETE FROM idempotency_keys WHERE key=? AND response_status=0').run(storedKey);
+    throw reason;
+  }
 }
-
 function noStore() { return { headers: { 'cache-control': 'no-store, private', pragma: 'no-cache' } }; }
 
 function openApiDocument() {
@@ -152,3 +177,5 @@ function openApiDocument() {
     }
   };
 }
+
+function isLoopbackAddress(address: string): boolean { return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'; }

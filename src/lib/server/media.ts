@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdir, rename, rm, stat } from 'node:fs/promises';
-import { dirname, extname, join, resolve } from 'node:path';
+import { dirname, extname, isAbsolute, join, relative as relativePath, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileTypeFromFile } from 'file-type';
@@ -83,9 +83,14 @@ export async function downloadMediaAsset(mediaId: string): Promise<void> {
       enqueuePendingScheduleDrafts(existingId);
       return;
     }
-    await rename(tempPath, finalPath);
-    db.prepare(`UPDATE media_assets SET sha256=?,local_path=?,mime_type=?,byte_size=?,state='stored',error=NULL,updated_at=? WHERE id=?`)
-      .run(sha256, relative, detected.mime, bytes, new Date().toISOString(), mediaId);
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const lockedUsed = Number((db.prepare("SELECT COALESCE(SUM(byte_size),0) AS total FROM media_assets WHERE state='stored'").get() as Row).total);
+      if (lockedUsed + bytes > config.mediaQuotaBytes) throw new Error('媒体配额不足');
+      await rename(tempPath, finalPath);
+      db.prepare(`UPDATE media_assets SET sha256=?,local_path=?,mime_type=?,byte_size=?,state='stored',error=NULL,updated_at=? WHERE id=?`).run(sha256, relative, detected.mime, bytes, new Date().toISOString(), mediaId);
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
     enqueuePendingScheduleDrafts(mediaId);
   } catch (error) {
     await rm(tempPath, { force: true });
@@ -115,7 +120,8 @@ export async function resolveMediaFile(mediaId: string): Promise<{ stream: Retur
   if (!row?.local_path) return null;
   const root = resolve(config.mediaDir);
   const path = resolve(root, String(row.local_path));
-  if (!path.startsWith(root + '\\') && !path.startsWith(root + '/')) return null;
+  const safeRelative = relativePath(root, path);
+  if (!safeRelative || safeRelative.startsWith('..') || isAbsolute(safeRelative)) return null;
   const info = await stat(path);
   return { stream: createReadStream(path), mime: String(row.mime_type ?? mimeFromExtension(path)), size: info.size };
 }
