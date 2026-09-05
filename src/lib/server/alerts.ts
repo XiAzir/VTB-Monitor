@@ -30,8 +30,7 @@ export async function sendAlertEmail(alertId: string): Promise<void> {
   await transport.sendMail({
     from: smtp.from,
     to: smtp.to,
-    subject: `[监控室老大爷] ${String(alert.title)}`,
+    subject: `[VTB Monitor] ${String(alert.title)}`,
     text: `${String(alert.message)}\n\n严重级别：${String(alert.severity)}\n首次发生：${String(alert.first_seen_at)}\n最近发生：${String(alert.last_seen_at)}`
   });
 }
-

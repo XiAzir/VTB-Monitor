@@ -6,7 +6,7 @@
   const statusLabel = (status: string) => ({ pending: '待识别', processing: '识别中', review: '待审核', failed: '失败', confirmed: '已确认', rejected: '已拒绝' })[status] ?? status;
 </script>
 
-<svelte:head><title>周表审核 · 监控室老大爷</title></svelte:head>
+<svelte:head><title>周表审核 · VTB Monitor</title></svelte:head>
 <section class="page schedule-admin">
   <a class="back" href="/admin"><ArrowLeft size={16} /> 返回后台</a>
   <div class="page-heading"><div><h1>周表审核</h1><p>图片识别结果确认后才进入正式单周安排</p></div></div>

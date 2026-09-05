@@ -1,4 +1,4 @@
-# VTB-Monitor 维护文档
+# VTB Monitor 维护文档
 
 ## 最近修改记录 (2026-08-22)
 

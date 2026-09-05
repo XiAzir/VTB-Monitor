@@ -24,7 +24,7 @@
   };
 </script>
 
-<svelte:head><title>监控台 · 监控室老大爷</title></svelte:head>
+<svelte:head><title>监控台 · VTB Monitor</title></svelte:head>
 
 <section class="page">
   <div class="page-heading">

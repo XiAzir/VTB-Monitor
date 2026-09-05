@@ -23,7 +23,7 @@
   const liveLabels: Record<string, string> = { live: '直播中', rotating: '轮播中', offline: '未开播', unknown: '状态未知' };
 </script>
 
-<svelte:head><title>后台管理 · 监控室老大爷</title></svelte:head>
+<svelte:head><title>后台管理 · VTB Monitor</title></svelte:head>
 
 {#if !data.authenticated}
   <section class="login-page">

@@ -8,7 +8,7 @@
   const liveStatusLabel = (status: string) => status === 'live' ? '正在直播' : status === 'rotating' ? '轮播中' : status === 'offline' ? '未开播' : '状态未知';
 </script>
 
-<svelte:head><title>{data.streamer.name} · 监控室老大爷</title></svelte:head>
+<svelte:head><title>{data.streamer.name} · VTB Monitor</title></svelte:head>
 
 <section class="page">
   <a class="back" href="/"><ArrowLeft size={16} /> 返回监控台</a>
