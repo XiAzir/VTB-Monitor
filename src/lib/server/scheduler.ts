@@ -37,6 +37,10 @@ export class Scheduler {
   private timers: NodeJS.Timeout[] = [];
   private running = false;
   private workerActive = false;
+  private readonly mode = process.env.SCHEDULER_MODE ?? 'full';
+  private readonly jobTypes = this.mode === 'core'
+    ? ['sync_streamer', 'refresh_dynamic', 'validate_cookie']
+    : undefined;
   private readonly workerLeaseOwner = `${config.processId}:${randomUUID()}`;
 
   start(): void {
@@ -124,7 +128,7 @@ export class Scheduler {
     try {
       while (this.running) {
         if (!acquireServiceLease('scheduler-worker', 30_000, this.workerLeaseOwner)) break;
-        const job = leaseNextJob();
+        const job = leaseNextJob(this.jobTypes);
         if (!job) break;
         try {
           await this.execute(job);
@@ -196,19 +200,20 @@ export class Scheduler {
     const fullSync = Boolean(payload.fullSync);
     const scanId = String(payload.scanId ?? randomUUID());
     const initializing = !streamer.dynamic_history_initialized_at;
+    const allowHistoricalSync = process.env.ALLOW_HISTORICAL_SYNC === '1';
     const since = new Date();
     since.setMonth(since.getMonth() - 6);
     const cookie = getBilibiliCookie();
     let client = createBilibiliClient(cookie);
     let feed;
     try {
-      feed = await client.fetchSpaceDynamics(String(streamer.bili_uid), (initializing || fullSync) ? 1000 : 30, (initializing || fullSync) ? since.toISOString() : undefined);
+      feed = await client.fetchSpaceDynamics(String(streamer.bili_uid), (allowHistoricalSync && (initializing || fullSync)) ? 1000 : 30, (allowHistoricalSync && (initializing || fullSync)) ? since.toISOString() : undefined);
     } catch (error) {
       markBilibiliCookieFailure(cookie, error);
       if (cookie && isInvalidCookie(error)) {
         upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', '已自动回退到匿名抓取，请尽快在后台更新 Cookie。');
         client = createBilibiliClient(null);
-        feed = await client.fetchSpaceDynamics(String(streamer.bili_uid), (initializing || fullSync) ? 1000 : 30, (initializing || fullSync) ? since.toISOString() : undefined);
+        feed = await client.fetchSpaceDynamics(String(streamer.bili_uid), (allowHistoricalSync && (initializing || fullSync)) ? 1000 : 30, (allowHistoricalSync && (initializing || fullSync)) ? since.toISOString() : undefined);
       } else {
         if (error instanceof BilibiliError && (error.status === 412 || error.code === 412)) {
           upsertAlert('bilibili-dynamic-rate-limited', 'warning', cookie ? '动态请求被 B站 风控拦截' : '动态抓取需要 B站 Cookie',
@@ -221,7 +226,7 @@ export class Scheduler {
     const dynamics = feed.items;
     const newDynamicIds: string[] = [];
     const revisionIds: Array<{ revisionId: string; dynamicId: string }> = [];
-    let detailBudget = (initializing || fullSync) ? Number.POSITIVE_INFINITY : 20;
+    let detailBudget = (allowHistoricalSync && (initializing || fullSync)) ? Number.POSITIVE_INFINITY : 20;
     let detailsFetched = 0;
     for (const dynamic of dynamics) {
       const existing = getDynamic(dynamic.id);
@@ -490,3 +495,5 @@ function hasRenderableDynamicCard(rawExcerpt: string | null | undefined): boolea
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
 function safeJson(value: string): Row { try { return JSON.parse(value) as Row; } catch { return {}; } }
 function formatError(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+
+
