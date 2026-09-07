@@ -2,10 +2,11 @@ import { expect, test } from '@playwright/test';
 
 test('public monitor, forecast range, archive filters and pagination render', async ({ page }) => {
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: '主播监控台' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /位主播在播/ })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '主播监控' })).toBeVisible();
   await expect(page.getByText('端到端测试主播')).toBeVisible();
-  await expect(page.getByText('时间范围')).toBeVisible();
   await page.goto('/streamers/e2e-streamer');
+  await expect(page.getByText('时间范围')).toBeVisible();
   await expect(page.getByText('目标周表动态 第二版')).toBeVisible();
   await expect(page.getByRole('link', { name: '加载更早动态' })).toBeVisible();
   await page.getByPlaceholder('搜索正文').fill('目标周表');
@@ -64,3 +65,4 @@ test('local management health endpoint is available', async ({ request }) => {
   expect(response.ok()).toBe(true);
   expect((await response.json()).status).toBe('ok');
 });
+
