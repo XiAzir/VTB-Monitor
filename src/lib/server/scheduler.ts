@@ -40,7 +40,9 @@ export class Scheduler {
   private readonly mode = process.env.SCHEDULER_MODE ?? 'full';
   private readonly jobTypes = this.mode === 'core'
     ? ['sync_streamer', 'refresh_dynamic', 'validate_cookie']
-    : undefined;
+    : this.mode === 'low'
+      ? ['sync_comments', 'sync_sub_replies', 'download_media', 'pi_analyze', 'pi_revision', 'recognize_schedule', 'repair_dynamic_archives', 'cleanup_storage', 'send_alert_email']
+      : undefined;
   private readonly workerLeaseOwner = `${config.processId}:${randomUUID()}`;
 
   start(): void {
@@ -495,5 +497,6 @@ function hasRenderableDynamicCard(rawExcerpt: string | null | undefined): boolea
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
 function safeJson(value: string): Row { try { return JSON.parse(value) as Row; } catch { return {}; } }
 function formatError(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+
 
 

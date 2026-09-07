@@ -1,0 +1,28 @@
+[Unit]
+Description=VTB Monitor low priority worker
+After=network-online.target vtb-monitor-scheduler.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vtb-monitor
+Group=vtb-monitor
+WorkingDirectory=/opt/vtb-monitor
+EnvironmentFile=/etc/vtb-monitor.env
+Environment=NODE_ENV=production
+Environment=SCHEDULER_MODE=low
+Environment=ALLOW_HISTORICAL_SYNC=0
+ExecStart=/usr/bin/npx --no-install tsx scripts/scheduler.ts
+Restart=on-failure
+RestartSec=30s
+TimeoutStopSec=15s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/vtb-monitor
+MemoryMax=256M
+CPUQuota=40%
+
+[Install]
+WantedBy=multi-user.target
