@@ -6,7 +6,7 @@ import { startScheduler, stopScheduler } from '$lib/server/scheduler';
 export const init: ServerInit = async () => {
   if (building) return;
   await ensureInitialAdmin();
-  if (process.env.DISABLE_SCHEDULER !== '1') startScheduler();
+  if (process.env.RUN_SCHEDULER === '1' && process.env.DISABLE_SCHEDULER !== '1') startScheduler();
 };
 
 if (import.meta.hot) import.meta.hot.dispose(() => stopScheduler());
@@ -18,3 +18,4 @@ export const handle: Handle = async ({ event, resolve }) => {
     filterSerializedResponseHeaders: (name) => name === 'content-type' || name === 'content-length'
   });
 };
+
