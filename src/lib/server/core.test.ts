@@ -272,11 +272,21 @@ describe('security and persistence', () => {
   it('prefers one full sync when periodic and daily sync are both due', () => {
     const streamerId = createStreamer({ slug: 'sync-priority', name: '同步优先级', biliUid: '10110', roomId: '20110' });
     getDb().prepare("UPDATE jobs SET status='done' WHERE type='sync_streamer' AND entity_id=?").run(streamerId);
-    new Scheduler().enqueueDueDynamicSyncs();
+    new Scheduler({ allowHistoricalSync: true }).enqueueDueDynamicSyncs();
     const active = getDb().prepare(`SELECT payload_json FROM jobs WHERE type='sync_streamer' AND entity_id=?
       AND status IN ('pending','retry','running')`).all(streamerId) as Array<{ payload_json: string }>;
     expect(active).toHaveLength(1);
     expect(JSON.parse(active[0].payload_json)).toEqual({ fullSync: true });
+  });
+
+  it('keeps incremental dynamic syncs active when historical sync is disabled', () => {
+    const streamerId = createStreamer({ slug: 'sync-incremental', name: '增量同步', biliUid: '10111', roomId: '20111' });
+    getDb().prepare("UPDATE jobs SET status='done' WHERE type='sync_streamer' AND entity_id=?").run(streamerId);
+    new Scheduler({ mode: 'core', allowHistoricalSync: false }).enqueueDueDynamicSyncs();
+    const active = getDb().prepare(`SELECT payload_json FROM jobs WHERE type='sync_streamer' AND entity_id=?
+      AND status IN ('pending','retry','running')`).all(streamerId) as Array<{ payload_json: string }>;
+    expect(active).toHaveLength(1);
+    expect(JSON.parse(active[0].payload_json)).toEqual({});
   });
 
   it('releases expired running jobs after a process restart', () => {

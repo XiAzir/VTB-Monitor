@@ -37,26 +37,41 @@ export class Scheduler {
   private timers: NodeJS.Timeout[] = [];
   private running = false;
   private workerActive = false;
-  private readonly mode = process.env.SCHEDULER_MODE ?? 'full';
-  private readonly jobTypes = this.mode === 'core'
-    ? ['sync_streamer', 'refresh_dynamic', 'validate_cookie']
-    : this.mode === 'low'
-      ? ['sync_comments', 'sync_sub_replies', 'download_media', 'pi_analyze', 'pi_revision', 'recognize_schedule', 'repair_dynamic_archives', 'cleanup_storage', 'send_alert_email']
-      : undefined;
+  private readonly mode: 'core' | 'low' | 'full';
+  private readonly allowHistoricalSync: boolean;
+  private readonly jobTypes: string[] | undefined;
   private readonly workerLeaseOwner = `${config.processId}:${randomUUID()}`;
+  private readonly workerLeaseName: string;
+
+  constructor(options: { mode?: 'core' | 'low' | 'full'; allowHistoricalSync?: boolean } = {}) {
+    const configuredMode = options.mode ?? process.env.SCHEDULER_MODE ?? 'full';
+    if (!['core', 'low', 'full'].includes(configuredMode)) throw new Error(`Invalid scheduler mode: ${configuredMode}`);
+    this.mode = configuredMode as 'core' | 'low' | 'full';
+    this.allowHistoricalSync = options.allowHistoricalSync ?? process.env.ALLOW_HISTORICAL_SYNC === '1';
+    this.jobTypes = this.mode === 'core'
+      ? ['sync_streamer', 'refresh_dynamic', 'validate_cookie']
+      : this.mode === 'low'
+        ? ['sync_comments', 'sync_sub_replies', 'download_media', 'pi_analyze', 'pi_revision', 'recognize_schedule', 'repair_dynamic_archives', 'cleanup_storage', 'send_alert_email']
+        : undefined;
+    this.workerLeaseName = `scheduler-worker:${this.mode}`;
+  }
 
   start(): void {
     if (this.running) return;
     this.running = true;
-    this.timers.push(setInterval(() => void this.pollLive(), 15_000));
-    this.timers.push(setInterval(() => this.enqueueDueDynamicSyncs(), 30_000));
-    this.timers.push(setInterval(() => rollOverdueForecasts(), 60_000));
-    this.timers.push(setInterval(() => enqueueJob('cleanup_storage', null, {}, 95, new Date().toISOString(), `cleanup-storage:${new Date().toISOString().slice(0, 10)}`), 6 * 3600_000));
+    if (this.mode !== 'low') {
+      this.timers.push(setInterval(() => void this.pollLive(), 15_000));
+      this.timers.push(setInterval(() => this.enqueueDueDynamicSyncs(), 30_000));
+      this.timers.push(setInterval(() => rollOverdueForecasts(), 60_000));
+      void this.pollLive();
+      this.enqueueDueDynamicSyncs();
+    }
+    if (this.mode !== 'core') {
+      this.timers.push(setInterval(() => enqueueJob('cleanup_storage', null, {}, 95, new Date().toISOString(), `cleanup-storage:${new Date().toISOString().slice(0, 10)}`), 6 * 3600_000));
+      enqueueJob('repair_dynamic_archives', null, {}, 70, new Date().toISOString(), `repair-dynamics:${new Date().toISOString().slice(0, 10)}`);
+      enqueueJob('cleanup_storage', null, {}, 95, new Date().toISOString(), `cleanup-storage:${new Date().toISOString().slice(0, 10)}`);
+    }
     this.timers.push(setInterval(() => void this.work(), 750));
-    void this.pollLive();
-    this.enqueueDueDynamicSyncs();
-    enqueueJob('repair_dynamic_archives', null, {}, 70, new Date().toISOString(), `repair-dynamics:${new Date().toISOString().slice(0, 10)}`);
-    enqueueJob('cleanup_storage', null, {}, 95, new Date().toISOString(), `cleanup-storage:${new Date().toISOString().slice(0, 10)}`);
     void this.work();
   }
 
@@ -75,7 +90,7 @@ export class Scheduler {
       if (syncQueued) continue;
       const last = row.last_dynamic_sync_at ? new Date(String(row.last_dynamic_sync_at)).getTime() : 0;
       const fullLast = row.last_dynamic_full_sync_at ? new Date(String(row.last_dynamic_full_sync_at)).getTime() : 0;
-      if (timestamp - fullLast >= 24 * 3600_000) {
+      if (this.allowHistoricalSync && timestamp - fullLast >= 24 * 3600_000) {
         const day = Math.floor(timestamp / (24 * 3600_000));
         enqueueJob('sync_streamer', String(row.id), { fullSync: true }, 18, new Date().toISOString(), `daily-full-sync:${row.id}:${day}`);
       } else if (timestamp - last >= Number(row.dynamic_poll_seconds) * 1000) {
@@ -121,15 +136,15 @@ export class Scheduler {
 
   private async work(): Promise<void> {
     if (!this.running || this.workerActive) return;
-    if (!acquireServiceLease('scheduler-worker', 30_000, this.workerLeaseOwner)) return;
+    if (!acquireServiceLease(this.workerLeaseName, 30_000, this.workerLeaseOwner)) return;
     this.workerActive = true;
     const heartbeat = setInterval(() => {
-      if (this.running) acquireServiceLease('scheduler-worker', 30_000, this.workerLeaseOwner);
+      if (this.running) acquireServiceLease(this.workerLeaseName, 30_000, this.workerLeaseOwner);
     }, 10_000);
     heartbeat.unref();
     try {
       while (this.running) {
-        if (!acquireServiceLease('scheduler-worker', 30_000, this.workerLeaseOwner)) break;
+        if (!acquireServiceLease(this.workerLeaseName, 30_000, this.workerLeaseOwner)) break;
         const job = leaseNextJob(this.jobTypes);
         if (!job) break;
         try {
@@ -152,7 +167,7 @@ export class Scheduler {
     } finally {
       clearInterval(heartbeat);
       this.workerActive = false;
-      releaseServiceLease('scheduler-worker', this.workerLeaseOwner);
+      releaseServiceLease(this.workerLeaseName, this.workerLeaseOwner);
     }
   }
 
@@ -202,20 +217,20 @@ export class Scheduler {
     const fullSync = Boolean(payload.fullSync);
     const scanId = String(payload.scanId ?? randomUUID());
     const initializing = !streamer.dynamic_history_initialized_at;
-    const allowHistoricalSync = process.env.ALLOW_HISTORICAL_SYNC === '1';
+    const historicalSyncRequested = this.allowHistoricalSync && (initializing || fullSync);
     const since = new Date();
     since.setMonth(since.getMonth() - 6);
     const cookie = getBilibiliCookie();
     let client = createBilibiliClient(cookie);
     let feed;
     try {
-      feed = await client.fetchSpaceDynamics(String(streamer.bili_uid), (allowHistoricalSync && (initializing || fullSync)) ? 1000 : 30, (allowHistoricalSync && (initializing || fullSync)) ? since.toISOString() : undefined);
+      feed = await client.fetchSpaceDynamics(String(streamer.bili_uid), historicalSyncRequested ? 1000 : 30, historicalSyncRequested ? since.toISOString() : undefined);
     } catch (error) {
       markBilibiliCookieFailure(cookie, error);
       if (cookie && isInvalidCookie(error)) {
         upsertAlert('bilibili-cookie-invalid', 'critical', 'B站 Cookie 已失效', '已自动回退到匿名抓取，请尽快在后台更新 Cookie。');
         client = createBilibiliClient(null);
-        feed = await client.fetchSpaceDynamics(String(streamer.bili_uid), (allowHistoricalSync && (initializing || fullSync)) ? 1000 : 30, (allowHistoricalSync && (initializing || fullSync)) ? since.toISOString() : undefined);
+        feed = await client.fetchSpaceDynamics(String(streamer.bili_uid), historicalSyncRequested ? 1000 : 30, historicalSyncRequested ? since.toISOString() : undefined);
       } else {
         if (error instanceof BilibiliError && (error.status === 412 || error.code === 412)) {
           upsertAlert('bilibili-dynamic-rate-limited', 'warning', cookie ? '动态请求被 B站 风控拦截' : '动态抓取需要 B站 Cookie',
@@ -228,7 +243,7 @@ export class Scheduler {
     const dynamics = feed.items;
     const newDynamicIds: string[] = [];
     const revisionIds: Array<{ revisionId: string; dynamicId: string }> = [];
-    let detailBudget = (allowHistoricalSync && (initializing || fullSync)) ? Number.POSITIVE_INFINITY : 20;
+    let detailBudget = historicalSyncRequested ? Number.POSITIVE_INFINITY : 20;
     let detailsFetched = 0;
     for (const dynamic of dynamics) {
       const existing = getDynamic(dynamic.id);
@@ -279,15 +294,15 @@ export class Scheduler {
       else if (stored.changed && stored.revisionId) revisionIds.push({ revisionId: stored.revisionId, dynamicId: dynamic.id });
       if (dynamic.avatarUrl) getDb().prepare('UPDATE streamers SET avatar_url=COALESCE(avatar_url,?),updated_at=? WHERE id=?').run(dynamic.avatarUrl, new Date().toISOString(), streamerId);
     }
-    if ((initializing || fullSync) && feed.complete) {
+    if (historicalSyncRequested && feed.complete) {
       markMissingDynamicsDeleted(streamerId, dynamics.map((item) => item.id), since.toISOString(), scanId);
     }
-    if ((initializing || fullSync) && feed.complete) getDb().prepare('UPDATE streamers SET dynamic_history_initialized_at=COALESCE(dynamic_history_initialized_at,?),last_dynamic_full_sync_at=?,updated_at=? WHERE id=?')
+    if (historicalSyncRequested && feed.complete) getDb().prepare('UPDATE streamers SET dynamic_history_initialized_at=COALESCE(dynamic_history_initialized_at,?),last_dynamic_full_sync_at=?,updated_at=? WHERE id=?')
       .run(new Date().toISOString(), new Date().toISOString(), new Date().toISOString(), streamerId);
     getDb().prepare('UPDATE streamers SET last_dynamic_sync_at=?,updated_at=? WHERE id=?')
       .run(new Date().toISOString(), new Date().toISOString(), streamerId);
     stagePiDynamicIds(streamerId, newDynamicIds);
-    const completedRequestedRange = !(initializing || fullSync) || feed.complete;
+    const completedRequestedRange = !historicalSyncRequested || feed.complete;
     if (completedRequestedRange) {
       queuePiDynamicBatch(streamerId, newDynamicIds, initializing, initializing ? 0 : 30_000);
       for (const revision of revisionIds) queuePiRevisionAnalysis(revision.revisionId, revision.dynamicId, 30_000);
