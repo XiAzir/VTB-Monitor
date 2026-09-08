@@ -9,7 +9,9 @@ User=vtb-monitor
 Group=vtb-monitor
 WorkingDirectory=/opt/vtb-monitor
 EnvironmentFile=/etc/vtb-monitor.env
-Environment=NODE_ENV=production`r`nEnvironment=SCHEDULER_MODE=core`r`nEnvironment=ALLOW_HISTORICAL_SYNC=0
+Environment=NODE_ENV=production
+Environment=SCHEDULER_MODE=core
+Environment=ALLOW_HISTORICAL_SYNC=0
 ExecStart=/usr/bin/npx --no-install tsx scripts/scheduler.ts
 Restart=on-failure
 RestartSec=10s
