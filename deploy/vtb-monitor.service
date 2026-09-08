@@ -10,7 +10,7 @@ Group=vtb-monitor
 WorkingDirectory=/opt/vtb-monitor
 EnvironmentFile=/etc/vtb-monitor.env
 Environment=NODE_ENV=production
-ExecStart=/usr/bin/node server/index.js
+ExecStart=/opt/node-v24.18.1-linux-x64/bin/node server/index.js
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=15s
@@ -19,7 +19,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/vtb-monitor
-MemoryMax=768M
+MemoryMax=384M
 
 [Install]
 WantedBy=multi-user.target

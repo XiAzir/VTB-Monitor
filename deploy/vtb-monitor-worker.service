@@ -12,7 +12,7 @@ EnvironmentFile=/etc/vtb-monitor.env
 Environment=NODE_ENV=production
 Environment=SCHEDULER_MODE=low
 Environment=ALLOW_HISTORICAL_SYNC=0
-ExecStart=/usr/bin/npx --no-install tsx scripts/scheduler.ts
+ExecStart=/opt/node-v24.18.1-linux-x64/bin/node --import tsx scripts/scheduler.ts
 Restart=on-failure
 RestartSec=30s
 TimeoutStopSec=15s
