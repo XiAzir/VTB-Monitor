@@ -1,0 +1,39 @@
+name: Rust low-memory validation
+on:
+  push:
+    branches: [experiment/rust-low-memory-20260912]
+    paths: ['rust/**', '.github/workflows/rust-low-memory.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain and environment
+        run: |
+          rustc --version
+          cargo --version
+          uname -a
+          cat /sys/fs/cgroup/cgroup.controllers
+      - name: Rust tests
+        if: ${{ hashFiles('rust/Cargo.toml') != '' }}
+        run: |
+          cd rust
+          cargo test --all-targets
+          cargo build --release
+      - name: Functional replay and ablation
+        if: ${{ hashFiles('rust/tests/acceptance.py') != '' }}
+        run: |
+          python3 rust/tests/acceptance.py --binary rust/target/release/vtb-monitor-rs
+          sudo python3 rust/tests/ablation.py --binary rust/target/release/vtb-monitor-rs --repetitions 3 --memory-mib 150
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-low-memory-results
+          path: |
+            rust/results/
+            rust/Cargo.lock
+          if-no-files-found: ignore
