@@ -7,6 +7,7 @@ pub mod business;
 pub mod upstream;
 pub mod ai;
 pub mod engine;
+pub mod forecast;
 pub mod mail;
 pub mod api;
 
@@ -46,9 +47,9 @@ impl App {
             if url.scheme()!="http" || !["127.0.0.1","[::1]","localhost"].contains(&host){bail!("test mock must use loopback HTTP");}
         }
         let proxy=db.call(|db|db::setting(db,"bilibili_proxy_url")).await?;
-        let bili_client=if let Some(proxy)=proxy.as_str().filter(|s|!s.is_empty()){
+        let bili_client=if let Some(proxy)=proxy.as_str().filter(|s|!s.is_empty()) {
             reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(40)).connect_timeout(std::time::Duration::from_secs(8)).pool_max_idle_per_host(1).proxy(reqwest::Proxy::all(proxy)?).build()?
-        }else{client.clone()};
+        } else {client.clone()};
         let bili=upstream::Bili::new(db.clone(),bili_client,key,mock);
         let initial=std::env::var("ADMIN_INITIAL_PASSWORD").ok();
         let count=db.call(|db|Ok(db.query_row("SELECT COUNT(*) FROM admins",[],|r|r.get::<_,i64>(0))?)).await?;
