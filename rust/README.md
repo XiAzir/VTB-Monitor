@@ -39,7 +39,7 @@ export DISABLE_SCHEDULER=1
 
 主密钥必须沿用，不得重新生成后覆盖旧密文。新空库支持 `ADMIN_INITIAL_PASSWORD` 一次初始化，登录改密后移除。只有 Rust 启动辅助进程，不能单独运行 sidecar；其端口和能力令牌不对外发布。
 
-服务示例：`hybrid/vtb-monitor-hybrid.service`。反代配置片段：`hybrid/nginx-location.conf`，包含 Pi 路由关闭响应缓冲。不要公开4312或Node的随机私有端口。
+服务示例：`hybrid/vtb-monitor-hybrid.service`，使用独立的 `/etc/vtb-monitor-hybrid.env` 与 `/var/lib/vtb-monitor-hybrid`，避免误用旧服务的数据路径。从原受保护配置中沿用同一主密钥；环境文件权限设为 0600，并核对 `DATA_DIR`、`DATABASE_PATH`、`MEDIA_DIR` 三者一致。自定义数据位置时同时调整服务的写入允许目录。反代配置片段：`hybrid/nginx-location.conf`，包含 Pi 路由关闭响应缓冲。不要公开4312或Node的随机私有端口。
 
 ## 数据与调度切换
 
@@ -59,7 +59,7 @@ export DISABLE_SCHEDULER=1
 
 周表只规划元数据，执行时逐批读取；单批10MiB，缺图等待/失败，不提交部分证据。超大图自动切片未实现。新Pi历史不重复存base64，媒体归档保留；不会上线即删除旧历史。
 
-大HTTP请求边界可触发GC，仅回收不可达对象，不改provider请求内容或流式响应；`VTBM_REQUEST_GC=0`可做消融对照。它有CPU代价，不应依据一次测量推断长期收益。后台任务仍有有界截止时间与重试；超长模型/多图任务需要在目标环境验证。
+大 HTTP 请求边界主动 GC 现为默认关闭，仅显式 `VTBM_REQUEST_GC=1` 开启。前一轮三次重复中未显示降低峰值的收益，因此不再默认启用；新消融使用 `default`（关闭）与 `with_request_boundary_gc`（开启）两组。同样的原 SDK、图片字节和工具流均保留，不以减少模型输入换取成绩。后台任务仍有有界截止时间与重试；超长模型/多图任务需要在目标环境验证。
 
 ## 验证与结果解释
 
