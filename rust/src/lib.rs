@@ -8,6 +8,7 @@ pub mod upstream;
 pub mod ai;
 pub mod engine;
 pub mod forecast;
+pub mod monitor;
 pub mod mail;
 pub mod api;
 
