@@ -301,7 +301,7 @@ fn mutate(db: &mut Connection, who: &Actor, path: &str, body: &Value, method: &M
 async fn streamer_compat(State(app): State<Arc<App>>) -> Response {
     match app.db.call(|db|rows(db,"SELECT s.id,s.slug,s.name,s.bili_uid AS biliUid,s.room_id AS roomId,s.avatar_url AS avatarUrl,COALESCE(ls.status,'unknown') AS liveStatus,ls.title AS liveTitle,ls.checked_at AS lastCheckedAt,f.predicted_start_at AS predictedStartAt,f.confidence AS predictionConfidence,f.source AS predictionSource,f.reason AS predictionReason,f.stale AS predictionStale FROM streamers s LEFT JOIN live_state ls ON ls.streamer_id=s.id LEFT JOIN forecasts f ON f.id=(SELECT id FROM forecasts WHERE streamer_id=s.id AND active=1 ORDER BY created_at DESC LIMIT 1) WHERE s.enabled=1 ORDER BY s.name LIMIT 100",&[],100)).await { Ok(data)=>Json(json!({"streamers":data})).into_response(),Err(e)=>error_response(e) }
 }
-async fn local_media(State(app): State<Arc<App>>, Path(mid): Path<String>) -> Response {
+pub(crate) async fn local_media(State(app): State<Arc<App>>, Path(mid): Path<String>) -> Response {
     let result=async {
         let permit=app.media_slots.clone().try_acquire_owned().map_err(|_|anyhow::anyhow!("BUSY: media capacity"))?;
         let row=app.db.call(move|db|one(db,"SELECT local_path,mime_type,sha256 FROM media_assets WHERE id=? AND state='stored'",&[&mid])).await?;
@@ -313,7 +313,7 @@ async fn local_media(State(app): State<Arc<App>>, Path(mid): Path<String>) -> Re
     }.await;
     match result { Ok(r)=>r,Err(e)=>error_response(e) }
 }
-async fn image_proxy(State(app): State<Arc<App>>, Path(path): Path<String>) -> Response {
+pub(crate) async fn image_proxy(State(app): State<Arc<App>>, Path(path): Path<String>) -> Response {
     let result=async {
         let permit=app.media_slots.clone().try_acquire_owned().map_err(|_|anyhow::anyhow!("BUSY: image proxy capacity"))?;
         let raw=if path.starts_with("//"){format!("https:{path}")}else if path.starts_with("http"){path}else{format!("https://{path}")};

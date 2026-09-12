@@ -11,6 +11,7 @@ pub mod forecast;
 pub mod monitor;
 pub mod mail;
 pub mod api;
+pub mod hybrid;
 
 use anyhow::{bail,Result};
 use rusqlite::params;
@@ -18,6 +19,7 @@ use std::{path::PathBuf,sync::{Arc,atomic::AtomicBool}};
 use tokio::sync::Semaphore;
 
 pub struct App {
+    pub bridge: Option<Arc<hybrid::Bridge>>,
     pub db:db::Db,
     pub client:reqwest::Client,
     pub bili:upstream::Bili,
@@ -66,6 +68,7 @@ impl App {
         let parsed=url::Url::parse(&origin)?;
         if parsed.origin().ascii_serialization()!=origin {bail!("ORIGIN must be an exact origin with no trailing slash or path");}
         let quota=std::env::var("MEDIA_QUOTA_BYTES").ok().map(|s|s.parse::<u64>()).transpose()?.unwrap_or(5*1024*1024*1024);
-        Ok(Arc::new(Self{db,client,bili,key,media_dir,media_quota:quota,origin,expensive:Arc::new(Semaphore::new(1)),api_slots:Arc::new(Semaphore::new(4)),media_slots:Arc::new(Semaphore::new(2)),stopping:AtomicBool::new(false),dummy_password_hash}))
+        let bridge = if std::env::var("VTBM_NATIVE_EXPERIMENTAL").as_deref() == Ok("1") { None } else { Some(hybrid::Bridge::new()?) };
+        Ok(Arc::new(Self{bridge,db,client,bili,key,media_dir,media_quota:quota,origin,expensive:Arc::new(Semaphore::new(1)),api_slots:Arc::new(Semaphore::new(4)),media_slots:Arc::new(Semaphore::new(2)),stopping:AtomicBool::new(false),dummy_password_hash}))
     }
 }

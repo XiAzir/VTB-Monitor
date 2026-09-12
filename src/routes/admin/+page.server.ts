@@ -1,6 +1,6 @@
 import { error, fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
-import { getPiStatus } from '$lib/server/pi';
+import { getPiStatus } from '$lib/server/pi-profile';
 import {
   acknowledgeAlert, acknowledgeAllAlerts, changeAdminPassword, createAdminSession, createApiToken, createStreamer, deleteAdminSession, enqueueJob,
   findAdminByUsername, getDashboardStats, getSetting, listAdminStreamers, listAlerts, listApiTokens,

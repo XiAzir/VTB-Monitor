@@ -132,7 +132,8 @@ async fn forward(app: Arc<App>, request: Request<Body>, management: bool) -> Res
 }
 async fn forward_inner(app: Arc<App>, request: Request<Body>, management: bool) -> Result<Response> {
     let bridge = app.bridge.as_ref().context("hybrid adapter disabled")?;
-    let api_permit = app.api_slots.clone().try_acquire_owned().map_err(|_|anyhow::anyhow!("BUSY: request capacity"))?;
+    let api_permit = tokio::time::timeout(Duration::from_secs(15), app.api_slots.clone().acquire_owned()).await
+        .context("BUSY: request admission deadline")?.context("request admission closed")?;
     let (parts,body) = request.into_parts();
     // The first route segment is chosen here, never from a caller-controlled header.
     let namespace = if management { "management" } else { "web" };

@@ -68,6 +68,11 @@ async fn poll_live(app:&Arc<App>)->Result<()>{
     }Ok(())
 }
 async fn execute(app:&Arc<App>,job:&Value)->Result<()>{
+    if let Some(bridge) = &app.bridge {
+        if ["rs_analyze_dynamic", "pi_analyze", "pi_revision", "recognize_schedule"].contains(&strv(job, "type")) {
+            return bridge.run_job(app, job).await;
+        }
+    }
     let entity=strv(job,"entity_id");let payload:Value=serde_json::from_str(strv(job,"payload_json")).unwrap_or(json!({}));
     match strv(job,"type"){
         "sync_streamer"=>sync_streamer(app,entity,payload).await,

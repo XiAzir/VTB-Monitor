@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { Agent, type AgentMessage, type AgentTool } from '@earendil-works/pi-agent-core';
 import { createModels, type Model, type Api } from '@earendil-works/pi-ai';
@@ -46,29 +46,9 @@ const MAX_SINGLE_DYNAMIC_TEXT_CHARS = 12_000;
 const MAX_CONVERSATION_MESSAGES = 200;
 const MAX_CONVERSATION_BYTES = 2 * 1024 * 1024;
 
-export interface PiProfile {
-  provider: 'anthropic' | 'openai' | 'google' | 'openrouter';
-  modelId: string;
-  apiKeySecret?: string;
-  baseUrl?: string;
-  thinkingLevel?: 'off' | 'minimal' | 'low' | 'medium' | 'high';
-  input?: Array<'text' | 'image'>;
-  output?: Array<'text'>;
-  reasoning?: boolean;
-  sessionAffinity?: boolean;
-}
-
-const DEFAULT_PROFILE: PiProfile = {
-  provider: 'openai',
-  modelId: 'gpt-5.4-mini',
-  apiKeySecret: 'pi_api_key',
-  thinkingLevel: 'low',
-  input: ['text', 'image'],
-  output: ['text'],
-  reasoning: true
-};
-
-let activeRuns = 0;
+import { DEFAULT_PROFILE, piRuntime, getPiStatus, type PiProfile } from './pi-profile';
+export { getPiStatus };
+export type { PiProfile };
 
 export async function analyzeStreamerWithPi(streamerId: string, event: Row): Promise<void> {
   const streamer = getDb().prepare('SELECT * FROM streamers WHERE id=?').get(streamerId) as Row | undefined;
@@ -121,7 +101,7 @@ async function analyzeStreamerWithPiLocked(streamerId: string, streamer: Row, ev
       if (eventAny.message.stopReason === 'error') finalError = eventAny.message.errorMessage;
     }
   });
-  activeRuns += 1;
+  piRuntime.activeRuns += 1;
   try {
     const batchImages = await loadAnalysisImages(streamerId, batch);
     await agent.prompt(buildStreamerContext(streamerId, batch, typeof event.instruction === 'string' ? event.instruction : undefined), batchImages);
@@ -147,7 +127,7 @@ async function analyzeStreamerWithPiLocked(streamerId: string, streamer: Row, ev
     getDb().prepare("UPDATE forecasts SET stale=1 WHERE streamer_id=? AND active=1 AND source IN ('pi','fallback')").run(streamerId);
     throw error;
   } finally {
-    activeRuns -= 1;
+    piRuntime.activeRuns -= 1;
   }
 }
 
@@ -186,7 +166,7 @@ export async function recognizeScheduleDraftWithPi(draftId: string): Promise<voi
     const { models, model } = createPiModel(profile);
     const mediaUrls = currentScheduleDraftMediaUrls(String(draft.dynamicId), draft.mediaUrls);
     const imageBatches = await loadScheduleImageBatches(mediaUrls);
-    const loadedImageCount = imageBatches.reduce((count, batch) => count + batch.images.length, 0);
+    const loadedImageCount = imageBatches.reduce((count, batch) => count + batch.positions.length, 0);
     if (loadedImageCount === 0) {
       const state = draftMediaState(mediaUrls);
       if (Number(state.pending ?? 0) > 0) {
@@ -199,7 +179,8 @@ export async function recognizeScheduleDraftWithPi(draftId: string): Promise<voi
     const allEntries: ScheduleDraftEntry[] = [];
     const rawBatches: unknown[] = [];
     for (const [batchIndex, scheduleBatch] of imageBatches.entries()) {
-      const batch = scheduleBatch.images;
+      const batch = await loadDraftImages(scheduleBatch.urls);
+      if (batch.length !== scheduleBatch.urls.length) throw new Error('图片证据不完整，识别草稿未提交');
       const batchEntries: ScheduleDraftEntry[] = [];
       let assistantMessage: any = null;
       let forcedToolError: string | null = null;
@@ -333,7 +314,7 @@ async function analyzeDynamicRevisionWithPiLocked(revisionId: string, row: Row, 
       if (eventAny.message.stopReason === 'error') finalError = eventAny.message.errorMessage;
     }
   });
-  activeRuns += 1;
+  piRuntime.activeRuns += 1;
   try {
     await agent.prompt(JSON.stringify({ mode: 'dynamic_revision', streamerTimezone: String(row.timezone),
       detectedAt: new Date().toISOString(), dynamic: { id: current.id, publishedAt: current.publishedAt, type: current.type,
@@ -361,7 +342,7 @@ async function analyzeDynamicRevisionWithPiLocked(revisionId: string, row: Row, 
       triggerReason: 'dynamic_revision', inputItemCount: 1, attemptNumber });
     throw error;
   } finally {
-    activeRuns -= 1;
+    piRuntime.activeRuns -= 1;
   }
 }
 
@@ -369,47 +350,11 @@ export class PiRevisionMediaPendingError extends Error {
   constructor() { super('等待动态修订图片完成本地归档'); this.name = 'PiRevisionMediaPendingError'; }
 }
 
-export interface AdminPiConversationSummary {
-  id: string;
-  title: string;
-  updatedAt: string;
-}
-
-export interface AdminPiDisplayMessage {
-  role: 'user' | 'assistant';
-  text: string;
-  createdAt: string;
-}
-
-export function listAdminPiConversations(adminId: string): AdminPiConversationSummary[] {
-  const prefix = `admin_v2:${adminId}:`;
-  const rows = getDb().prepare(`SELECT kind,title,updated_at FROM pi_conversations
-    WHERE streamer_id IS NULL AND kind LIKE ? ORDER BY updated_at DESC LIMIT 50`).all(`${prefix}%`) as Row[];
-  return rows.map((row) => ({ id: String(row.kind).slice(prefix.length), title: String(row.title), updatedAt: String(row.updated_at) }));
-}
-
-export function getAdminPiConversation(adminId: string, conversationId: string): AdminPiDisplayMessage[] | null {
-  const conversation = getDb().prepare('SELECT id FROM pi_conversations WHERE streamer_id IS NULL AND kind=?')
-    .get(`admin_v2:${adminId}:${conversationId}`) as Row | undefined;
-  if (!conversation) return null;
-  const rows = getDb().prepare(`SELECT role,content_json,created_at FROM pi_messages WHERE conversation_id=?
-    AND role IN ('user','assistant') ORDER BY created_at,id LIMIT 200`).all(String(conversation.id)) as Row[];
-  return rows.flatMap((row) => {
-    try {
-      const message = JSON.parse(String(row.content_json)) as Row;
-      const text = typeof message.content === 'string' ? message.content
-        : Array.isArray(message.content) ? message.content
-          .filter((block: Row) => block?.type === 'text' && typeof block.text === 'string')
-          .map((block: Row) => String(block.text)).join('') : '';
-      const role = String(row.role);
-      return text && (role === 'user' || role === 'assistant')
-        ? [{ role, text, createdAt: String(row.created_at) } as AdminPiDisplayMessage] : [];
-    } catch { return []; }
-  });
-}
+export { listAdminPiConversations, getAdminPiConversation } from './pi-history';
+export type { AdminPiConversationSummary, AdminPiDisplayMessage } from './pi-history';
 
 export async function runAdminPiPrompt(prompt: string, conversationKey: string, onText?: (text: string) => void, signal?: AbortSignal): Promise<string> {
-  if (activeRuns > 0) throw new Error('Pi 正在分析主播，请稍后重试');
+  if (piRuntime.activeRuns > 0) throw new Error('Pi 正在分析主播，请稍后重试');
   const profile = getSetting<PiProfile>('pi_profile', DEFAULT_PROFILE);
   const apiKey = getSecret(profile.apiKeySecret ?? 'pi_api_key');
   if (!apiKey) throw new Error('Pi API Key 尚未配置');
@@ -438,19 +383,16 @@ export async function runAdminPiPrompt(prompt: string, conversationKey: string, 
     }
     if (eventAny.type === 'message_end') persistMessage(conversationId, eventAny.message);
   });
+  piRuntime.activeRuns += 1;
   try {
     if (signal?.aborted) throw signal.reason ?? new DOMException('请求已取消', 'AbortError');
     await agent.prompt(prompt);
     markPiConnectionValid(profile);
     return output;
   } finally {
+    piRuntime.activeRuns -= 1;
     signal?.removeEventListener('abort', abort);
   }
-}
-
-export function getPiStatus(): { configured: boolean; profile: PiProfile; activeRuns: number } {
-  const profile = getSetting<PiProfile>('pi_profile', DEFAULT_PROFILE);
-  return { configured: Boolean(getSecret(profile.apiKeySecret ?? 'pi_api_key')), profile, activeRuns };
 }
 
 function markPiConnectionValid(profile: PiProfile): void {
@@ -689,8 +631,11 @@ async function loadDraftImages(urls: string[]): Promise<Array<{ type: 'image'; d
   for (const url of urls) {
     const row = byUrl.get(url);
     if (!row) continue;
-    const content = await readFile(resolve(config.mediaDir, String(row.local_path)));
-    if (bytes + content.length > 10 * 1024 * 1024) break;
+    const path = resolve(config.mediaDir, String(row.local_path));
+    const info = await stat(path);
+    if (bytes + info.size > 10 * 1024 * 1024) throw new Error('图片超出单批 10 MiB 限制，需要切片或人工审核；未跳过证据');
+    const content = await readFile(path);
+    if (bytes + content.length > 10 * 1024 * 1024) throw new Error('图片在读取期间变化，识别未提交');
     bytes += content.length;
     result.push({ type: 'image', data: content.toString('base64'), mimeType: String(row.mime_type) });
   }
@@ -703,25 +648,24 @@ function currentScheduleDraftMediaUrls(dynamicId: string, fallback: string[]): s
   return rows.length > 0 ? rows.map((row) => String(row.source_url)) : fallback;
 }
 
-async function loadScheduleImageBatches(urls: string[]): Promise<Array<{
-  images: Array<{ type: 'image'; data: string; mimeType: string }>; positions: number[]
-}>> {
-  const batches: Array<{ images: Array<{ type: 'image'; data: string; mimeType: string }>; positions: number[]; bytes: number }> = [];
+async function loadScheduleImageBatches(urls: string[]): Promise<Array<{ urls: string[]; positions: number[] }>> {
+  // Plan using metadata only. The caller loads ONE batch just before invoking Pi.
+  const batches: Array<{ urls: string[]; positions: number[]; bytes: number }> = [];
   for (const [position, url] of urls.entries()) {
-    const images = await loadDraftImages([url]);
-    const image = images[0];
-    if (!image) continue;
-    const byteSize = Buffer.byteLength(image.data, 'base64');
+    const row = getDb().prepare(`SELECT m.local_path FROM media_assets m WHERE m.state='stored' AND
+      (m.source_url=? OR EXISTS(SELECT 1 FROM media_source_aliases a WHERE a.media_id=m.id AND a.source_url=?)) LIMIT 1`)
+      .get(url, url) as Row | undefined;
+    if (!row) continue;
+    const { size } = await stat(resolve(config.mediaDir, String(row.local_path)));
+    if (size > 10 * 1024 * 1024) throw new Error('周表单图超过 10 MiB，需要切片或人工审核；未跳过证据');
     let batch = batches.at(-1);
-    if (!batch || batch.images.length >= 4 || batch.bytes + byteSize > 10 * 1024 * 1024) {
-      batch = { images: [], positions: [], bytes: 0 };
+    if (!batch || batch.urls.length >= 4 || batch.bytes + size > 10 * 1024 * 1024) {
+      batch = { urls: [], positions: [], bytes: 0 };
       batches.push(batch);
     }
-    batch.images.push(image);
-    batch.positions.push(position);
-    batch.bytes += byteSize;
+    batch.urls.push(url); batch.positions.push(position); batch.bytes += size;
   }
-  return batches.map(({ images, positions }) => ({ images, positions }));
+  return batches.map(({ urls, positions }) => ({ urls, positions }));
 }
 
 function forceInitialScheduleTool(payload: unknown): unknown {
@@ -837,7 +781,8 @@ function ensureStreamerConversation(streamerId: string, title: string): string {
 function persistMessage(conversationId: string, message: unknown): void {
   const value = message as Row;
   getDb().prepare(`INSERT INTO pi_messages(id,conversation_id,role,content_json,created_at) VALUES (?, ?, ?, ?, ?)`)
-    .run(randomUUID(), conversationId, String(value?.role ?? 'event'), JSON.stringify(message), new Date().toISOString());
+    .run(randomUUID(), conversationId, String(value?.role ?? 'event'), JSON.stringify(message, (_key, value) => value && typeof value === 'object' && value.type === 'image'
+      ? { type: 'text', text: '[图片保存在媒体归档中，不重复写入对话历史]' } : value), new Date().toISOString());
   getDb().prepare('UPDATE pi_conversations SET updated_at=? WHERE id=?').run(new Date().toISOString(), conversationId);
 }
 

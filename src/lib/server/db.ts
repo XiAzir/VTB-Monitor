@@ -12,7 +12,7 @@ export function getDb(): DatabaseSync {
     PRAGMA foreign_keys = ON;
     PRAGMA busy_timeout = 5000;
     PRAGMA synchronous = NORMAL;
-    PRAGMA temp_store = MEMORY;
+    PRAGMA temp_store = ${process.env.VTBM_HYBRID_CHILD === '1' ? 'FILE' : 'MEMORY'};
   `);
   runMigrations(database);
   return database;
