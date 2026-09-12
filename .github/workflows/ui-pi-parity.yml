@@ -1,0 +1,43 @@
+name: Original UI and TypeScript Pi validation
+on:
+  push:
+    branches: [refactor/original-ui-typescript-pi]
+    paths: ['.github/workflows/ui-pi-parity.yml', 'hybrid-validation.trigger']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ui-pi-parity-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Capture complete source
+        run: |
+          mkdir -p /tmp/parity-results
+          git archive --format=tar.gz -o /tmp/parity-results/source.tar.gz HEAD
+          { git rev-parse HEAD; node --version; npm --version; rustc --version; } > /tmp/parity-results/environment.txt
+      - name: Original dependency installation
+        run: |
+          set -o pipefail
+          npm ci --ignore-scripts 2>&1 | tee /tmp/parity-results/npm-ci.log
+      - name: Original checks
+        run: |
+          set -o pipefail
+          npm run check 2>&1 | tee /tmp/parity-results/check.log
+          npm test 2>&1 | tee /tmp/parity-results/tests.log
+          npm run build 2>&1 | tee /tmp/parity-results/build.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-pi-parity-results
+          path: /tmp/parity-results/
+          retention-days: 30
