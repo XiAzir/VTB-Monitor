@@ -1,23 +1,24 @@
 # Rust core + 原版 Svelte WebUI + 原版 TypeScript Pi
 
-本分支默认运行混合版本：Rust 常驻承担采集、直播观测、持久队列、媒体和统一入口；原 SvelteKit 服务端与 TypeScript Pi 在一个私有、按需启动的 Node 子进程中运行。**不是纯 Rust、不是零 Node 内存**。`src/routes/**/*.svelte`、`src/lib/components/**/*.svelte` 和原 CSS 不重新仿写；原页面、表单动作、Cookie、管理 API 和 Pi 流式回复仍由原实现处理。
+默认架构：Rust 常驻负责统一入口、采集、直播观测、持久队列、媒体和数据库访问；原 SvelteKit 服务端与原 TypeScript Pi/SDK 运行于私有、按需启动的 Node 子进程。**不是纯 Rust，不是零 Node 内存。**原 8 个 `.svelte` 文件及 CSS 与 `cdb62d9` 完全一致，原页面、表单、Cookie、管理 API、Pi 逐段回复与历史使用原实现。
 
-旧实验中的 Rust Pi/简化静态界面不再是默认路径。仅显式 `VTBM_NATIVE_EXPERIMENTAL=1` 才能启用旧实验模式；不建议生产使用。旧实验的二十多 MiB 成绩不能用于证明混合版内存。
+旧 Rust Pi/简化页面不再走默认路径，仅显式 `VTBM_NATIVE_EXPERIMENTAL=1` 启用；它的旧内存成绩不能用来证明本混合版。
 
-## 本地构建
+## 构建与运行
 
-需要 Linux 对应架构的 Rust 工具链、Node 24（原项目最低 >=22.19）、生产 npm 依赖。开发机或 CI 构建，不在 1C1G 生产机上编译。
+在开发机或 CI 构建，不在 1C1G 生产机编译。需要对应 Linux 架构的 Rust 工具链、Node 24（原项目最低 >=22.19）及 npm 依赖。
 
 ```sh
 npm ci --ignore-scripts
 npm run check
 npm test
+node --test hybrid/request-memory.test.mjs
 npm run build
-cargo test --manifest-path rust/Cargo.toml --all-targets
-cargo build --manifest-path rust/Cargo.toml --release --bin vtb-monitor-rs
+cargo test --manifest-path rust/Cargo.toml --all-targets --locked
+cargo build --manifest-path rust/Cargo.toml --release --bin vtb-monitor-rs --locked
 ```
 
-从仓库根目录启动 `rust/target/release/vtb-monitor-rs`。必须同时部署 `build/`、`hybrid/sidecar.mjs` 和匹配锁文件的生产 `node_modules/`；单独复制 Rust 二进制不能运行原界面/Pi。不要上传 Windows 的 node_modules 到 Linux。
+部署必须包含 `build/`、`hybrid/sidecar.mjs`、`hybrid/request-memory.mjs`、Rust 二进制及匹配锁文件的生产 `node_modules/`。单独复制 Rust 二进制不能运行原界面/Pi。不要上传 Windows node_modules 到 Linux。`npm start` 仍是原 Node 程序的回退入口，不是本混合程序入口。
 
 ```sh
 export VTBM_APP_ROOT=/opt/vtb-monitor
@@ -25,52 +26,50 @@ export VTBM_NODE=/usr/bin/node
 export DATA_DIR=/var/lib/vtb-monitor-hybrid
 export DATABASE_PATH=/var/lib/vtb-monitor-hybrid/vtb-monitor.sqlite
 export MEDIA_DIR=/var/lib/vtb-monitor-hybrid/media
-export APP_ENCRYPTION_KEY='与原版相同的32字节base64主密钥'
 export NODE_ENV=production
 export HOST=127.0.0.1
 export PORT=4311
 export MANAGEMENT_PORT=4312
 export ORIGIN=https://你的站点域名
-# 初次核对数据时关闭采集，完成验证再删除这一行。
+# APP_ENCRYPTION_KEY 必须通过受保护环境配置沿用原32字节base64主密钥。
+# 首次演练关闭采集，核对通过后移除这一项。
 export DISABLE_SCHEDULER=1
 ./rust/target/release/vtb-monitor-rs
 ```
 
-主密钥必须沿用，不能为了让新服务启动而重新生成后覆盖旧密文。已有管理员时不覆盖密码。新空库可使用 `ADMIN_INITIAL_PASSWORD` 一次初始化，登录后更改并移除变量。
+主密钥必须沿用，不得重新生成后覆盖旧密文。新空库支持 `ADMIN_INITIAL_PASSWORD` 一次初始化，登录改密后移除。只有 Rust 启动辅助进程，不能单独运行 sidecar；其端口和能力令牌不对外发布。
 
-## 数据迁移与唯一调度器
+服务示例：`hybrid/vtb-monitor-hybrid.service`。反代配置片段：`hybrid/nginx-location.conf`，包含 Pi 路由关闭响应缓冲。不要公开4312或Node的随机私有端口。
 
-先暂停旧归档写入，保存数据库、媒体、配置及主密钥的一致性备份；演练用新目录与不同端口，不操作唯一的生产副本。
+## 数据与调度切换
+
+先保存数据库、媒体、配置及主密钥的一致性备份，在独立目录/端口演练：
 
 ```sh
 ./rust/target/release/vtb-monitor-rs migrate-copy /old/vtb-monitor.sqlite /new/vtb-monitor.sqlite
 ```
 
-命令拒绝覆盖目标，只复制数据库并迁移副本。媒体目录需另行复制；不要把数据库已复制误认为媒体也已迁移。确认数据和新功能前不启用采集；切换时停止旧 Web 内嵌调度、旧 scheduler 和旧 worker，避免抢同一任务、双重模型计费和重复请求 B 站。
+复制命令拒绝覆盖目标；原数据库不修改。**媒体目录需另行复制**。核对通过前关闭采集，切换时停止旧 Web 内嵌调度、旧 scheduler、旧 worker，避免同库抢任务、重复计费。不要将候选代码指向唯一的生产数据副本。
 
-新版本的 Node 子进程由 Rust 管理，不能再单独启动 `hybrid/sidecar.mjs`；它需要一次性端口与能力令牌。也不能同时运行旧 `npm start` 与新 Rust 在同一端口。`npm start` 仍保留原程序作为独立回退路径，不是混合模式入口。
+## 内存与行为边界
 
-## 内存与调度边界
+默认 Node old-space 48 MiB、semi-space 1 MiB，辅助进程空闲30秒回收。OS cgroup必须同时包含Rust与其Node子进程；V8参数不是RSS上限。访问频繁时Node持续存在，冷启动有延迟。
 
-- 常驻一个 Rust 进程；访问 WebUI 或有 Pi 任务时启动一个 Node 辅助进程。默认空闲 30 秒回收；活跃响应和 Pi 工作结束前不会按空闲规则回收。
-- Node old-space 默认 64 MiB、semi-space 2 MiB。**这些不是进程 RSS 或后端总内存上限**。OS cgroup 必须同时包含父进程和 Node 子进程。
-- `VTBM_SIDECAR_IDLE_MS` 可设 1000–3600000，默认 30000。更短会增加冷启动延迟与 CPU 消耗；访问频繁时辅助进程会持续存在，不承诺永远只占 Rust 空闲内存。
-- Rust 保留原始 Cookie、重定向、Svelte 增强表单协议、流式 Pi 响应与历史；API 请求并发/连接数量有界，繁忙可返回 503/Retry-After，不无限排队。
-- Pi仍使用原 SDK、provider、thinking/session 设置和原业务工具。图片批次只先读取元数据，执行时再加载一批；不再预先把所有图片批次转成 base64。单批 10 MiB；超限或缺图明确失败/等待，不把部分证据说成识别完成。自动图像切片仍未实现。
-- 新 Pi 对话存储不重复写内联图片，图片仍在媒体归档中。旧历史不会在上线时被破坏性清理。
-- 动态新增按原分析版本去重；动态编辑走原 `pi_revision`，保留旧事件供 Pi 判断，不先行清空。未来固定周表到期的投影仍走原 store 逻辑。
+原Pi SDK/provider、thinking/session设置、业务工具、普通多轮聊天保留。唯一有意缩短的流程是：周表/编辑分析的最终结构化提交成功，且本轮所有工具都成功后，使用SDK `shouldStopAfterTurn`结束；不再把同图重新发送只为生成结束语。空草稿可正常提交；工具失败仍可修复；普通聊天和主播分析不使用这一提前结束钩子。
 
-## 验证
+周表只规划元数据，执行时逐批读取；单批10MiB，缺图等待/失败，不提交部分证据。超大图自动切片未实现。新Pi历史不重复存base64，媒体归档保留；不会上线即删除旧历史。
+
+大HTTP请求边界可触发GC，仅回收不可达对象，不改provider请求内容或流式响应；`VTBM_REQUEST_GC=0`可做消融对照。它有CPU代价，不应依据一次测量推断长期收益。后台任务仍有有界截止时间与重试；超长模型/多图任务需要在目标环境验证。
+
+## 验证与结果解释
 
 ```sh
 npx playwright install chromium
 npx playwright test --config hybrid/playwright.config.ts
-# 独立 Linux 测试环境，需要 cgroup v2 与管理员权限。
 sudo env PATH="$PATH" python3 hybrid/acceptance.py --memory-mib 150
+sudo env PATH="$PATH" python3 hybrid/repeat-acceptance.py --memory-mib 150 --repetitions 3
 ```
 
-浏览器测试使用原 e2e 流程，并输出桌面/移动端截图。UI源码保真检查以 `cdb62d9` 为基准；空源码差异并不替代浏览器功能测试。
+最后两项必须在独立、支持cgroup v2的Linux测试环境运行。无法施加请求的限制就失败，不静默退化。原Pi和SDK实际运行，供应商是本地确定性SSE模拟服务，不访问真实B站/付费模型。9MiB GIF是合成字节负载，不代表OCR准确率测试。
 
-Pi集成使用真实 TypeScript Pi/SDK，供应商是本地确定性 SSE 模拟服务，不调用付费模型/B站。测试包括登录、管理端隔离、Pi逐段回复、历史、9 MiB图像到达供应商、周表工具写入、空闲回收和重新启动。**Rust及其Node子进程在同一个150 MiB cgroup中**；测试生成器/浏览器/模拟供应商在组外。结果需看同一次提交的 `hybrid/results/acceptance.json`，不能只用 Rust 的 VmRSS 来报告总量。
-
-真实模型准确率、每个供应商自定义网关、长期泄漏、生产数据量和更低的100 MiB限额仍需单独验收。原 TypeScript Pi 的历史时间语义缺陷并不会因为保留 SDK 自动消失；本轮侧重恢复原 UI/Pi 兼容性，不宣称已修复全部历史业务问题。
+内存以**完整后端cgroup**计量；不包含组外浏览器、模拟供应商、测试驱动或公用Nginx。各次原始采样、断言、OOM记录在对应CI artifact。短时通过不等于100MiB可用、全天稳定、每个自定义网关均兼容。请使用与源码提交一致的测试记录，勿引用早期纯Rust数据。

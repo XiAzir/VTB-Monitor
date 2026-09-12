@@ -9,4 +9,7 @@ data/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
-
+rust/target/
+rust/results/
+hybrid/results/
+**/__pycache__/
