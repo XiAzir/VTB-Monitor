@@ -1,5 +1,5 @@
 use anyhow::{bail,Context,Result};
-use std::{path::PathBuf,sync::atomic::Ordering,time::Duration};
+use std::{path::PathBuf,sync::atomic::Ordering,time::Duration,future::IntoFuture};
 use vtb_monitor_rs::{api,db,engine,limits,App};
 
 fn main()->Result<()> {
@@ -17,7 +17,8 @@ fn main()->Result<()> {
         println!("{}",serde_json::json!({"copiedAndMigrated":destination,"sourceUnmodified":true}));return Ok(());
     }
     let runtime=tokio::runtime::Builder::new_current_thread().enable_all().max_blocking_threads(2).thread_stack_size(512*1024).build()?;
-    runtime.block_on(async move {
+    let local=tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async move {
         let app=App::from_env().await?;
         if args.get(1).is_some_and(|s|s=="init") {println!("initialized");return Ok(());}
         let host=std::env::var("HOST").unwrap_or_else(|_|"127.0.0.1".into());
@@ -27,8 +28,8 @@ fn main()->Result<()> {
         let management_port=std::env::var("MANAGEMENT_PORT").unwrap_or_else(|_|"4312".into()).parse::<u16>()?;
         let listener=tokio::net::TcpListener::bind((address,port)).await?;
         let admin_listener=tokio::net::TcpListener::bind((address,management_port)).await?;
-        let worker=if std::env::var("DISABLE_SCHEDULER").as_deref()!=Ok("1") {Some(tokio::spawn(engine::run(app.clone())))}else{None};
-        let live=if worker.is_some(){Some(tokio::spawn(engine::live_loop(app.clone())))}else{None};
+        let worker=if std::env::var("DISABLE_SCHEDULER").as_deref()!=Ok("1") {Some(tokio::task::spawn_local(engine::run(app.clone())))}else{None};
+        let live=if worker.is_some(){Some(tokio::task::spawn_local(engine::live_loop(app.clone())))}else{None};
         let web=tokio::spawn(axum::serve(limits::LimitedListener::new(listener,16),api::router(app.clone())).into_future());
         let management=tokio::spawn(axum::serve(limits::LimitedListener::new(admin_listener,4),api::management_router(app.clone())).into_future());
         println!("{}",serde_json::json!({"event":"ready","pid":std::process::id(),"port":port,"managementPort":management_port,"runtime":"rust","scheduler":worker.is_some()}));
@@ -37,7 +38,6 @@ fn main()->Result<()> {
         app.stopping.store(true,Ordering::Relaxed);web.abort();management.abort();if let Some(live)=live{live.abort();}
         if let Some(worker)=worker{let _=tokio::time::timeout(Duration::from_secs(130),worker).await;}
         Ok::<(),anyhow::Error>(())
-    })?;
+    }))?;
     runtime.shutdown_timeout(Duration::from_secs(2));Ok(())
 }
-use std::future::IntoFuture;
