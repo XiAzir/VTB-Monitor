@@ -1,6 +1,6 @@
 use anyhow::{bail,Context,Result};
 use std::{path::PathBuf,sync::atomic::Ordering,time::Duration,future::IntoFuture};
-use vtb_monitor_rs::{api,db,engine,limits,App};
+use vtb_monitor_rs::{api,db,engine,forecast,limits,App};
 
 fn main()->Result<()> {
     let args:Vec<String>=std::env::args().collect();
@@ -28,14 +28,17 @@ fn main()->Result<()> {
         let management_port=std::env::var("MANAGEMENT_PORT").unwrap_or_else(|_|"4312".into()).parse::<u16>()?;
         let listener=tokio::net::TcpListener::bind((address,port)).await?;
         let admin_listener=tokio::net::TcpListener::bind((address,management_port)).await?;
-        let worker=if std::env::var("DISABLE_SCHEDULER").as_deref()!=Ok("1") {Some(tokio::task::spawn_local(engine::run(app.clone())))}else{None};
-        let live=if worker.is_some(){Some(tokio::task::spawn_local(engine::live_loop(app.clone())))}else{None};
+        let enabled=std::env::var("DISABLE_SCHEDULER").as_deref()!=Ok("1");
+        let worker=if enabled {Some(tokio::task::spawn_local(engine::run(app.clone())))}else{None};
+        let live=if enabled {Some(tokio::task::spawn_local(engine::live_loop(app.clone())))}else{None};
+        let predictions=if enabled {Some(tokio::task::spawn_local(forecast::run(app.clone())))}else{None};
         let web=tokio::spawn(axum::serve(limits::LimitedListener::new(listener,16),api::router(app.clone())).into_future());
         let management=tokio::spawn(axum::serve(limits::LimitedListener::new(admin_listener,4),api::management_router(app.clone())).into_future());
-        println!("{}",serde_json::json!({"event":"ready","pid":std::process::id(),"port":port,"managementPort":management_port,"runtime":"rust","scheduler":worker.is_some()}));
+        println!("{}",serde_json::json!({"event":"ready","pid":std::process::id(),"port":port,"managementPort":management_port,"runtime":"rust","scheduler":enabled}));
         #[cfg(unix)]{let mut term=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;tokio::select!{_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}}
         #[cfg(not(unix))]tokio::signal::ctrl_c().await?;
-        app.stopping.store(true,Ordering::Relaxed);web.abort();management.abort();if let Some(live)=live{live.abort();}
+        app.stopping.store(true,Ordering::Relaxed);web.abort();management.abort();
+        if let Some(live)=live{live.abort();}if let Some(predictions)=predictions{predictions.abort();}
         if let Some(worker)=worker{let _=tokio::time::timeout(Duration::from_secs(130),worker).await;}
         Ok::<(),anyhow::Error>(())
     }))?;
