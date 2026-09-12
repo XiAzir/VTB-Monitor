@@ -1,5 +1,5 @@
 import { error, json } from '@sveltejs/kit';
-import { getAdminPiConversation, listAdminPiConversations } from '$lib/server/pi';
+import { getAdminPiConversation, listAdminPiConversations } from '$lib/server/pi-history';
 
 const CONVERSATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 

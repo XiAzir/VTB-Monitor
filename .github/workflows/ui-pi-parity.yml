@@ -1,0 +1,82 @@
+name: Original UI and TypeScript Pi validation
+on:
+  push:
+    branches: [refactor/original-ui-typescript-pi]
+    paths: ['src/**', 'rust/**', 'hybrid/**', 'tests/e2e/**', 'package*.json', '.github/workflows/ui-pi-parity.yml', 'hybrid-validation.trigger']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ui-pi-parity-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: hybrid-rust-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+      - name: Capture environment and original UI source parity
+        run: |
+          mkdir -p hybrid/results
+          { git rev-parse HEAD; node --version; npm --version; rustc --version; uname -a; } | tee hybrid/results/environment.txt
+          git diff cdb62d9fe1dd0b52f710194a81df2b80872d986d -- '*.svelte' '*.css' > hybrid/results/ui-source.diff
+          test ! -s hybrid/results/ui-source.diff
+          node --check hybrid/sidecar.mjs
+          python3 -m py_compile hybrid/acceptance.py hybrid/repeat-acceptance.py
+      - name: Locked dependencies and production security audit
+        run: |
+          set -o pipefail
+          npm ci --ignore-scripts 2>&1 | tee hybrid/results/npm-ci.log
+          npm audit --omit=dev --json > hybrid/results/dependency-audit.json
+      - name: Original TypeScript Pi, Svelte and transport checks
+        run: |
+          set -o pipefail
+          npm run check 2>&1 | tee hybrid/results/check.log
+          npm test 2>&1 | tee hybrid/results/tests.log
+          node --test hybrid/request-memory.test.mjs 2>&1 | tee hybrid/results/transport-tests.log
+          npm run build 2>&1 | tee hybrid/results/build.log
+      - name: Locked Rust tests and build
+        run: |
+          set -o pipefail
+          cd rust
+          cargo test --all-targets --locked 2>&1 | tee ../hybrid/results/rust-tests.log
+          cargo build --release --bin vtb-monitor-rs --locked 2>&1 | tee ../hybrid/results/rust-build.log
+      - name: Original browser workflows against Rust entry
+        run: |
+          set -o pipefail
+          npx playwright install --with-deps chromium
+          npx playwright test --config hybrid/playwright.config.ts 2>&1 | tee hybrid/results/browser.log
+      - name: Repeat complete-backend 150 MiB integration and GC ablation
+        run: |
+          set -o pipefail
+          sudo env PATH="$PATH" python3 hybrid/repeat-acceptance.py --memory-mib 150 --repetitions 3 2>&1 | tee hybrid/results/repeated-integration.log
+      - name: Package exact source and raw results
+        if: always()
+        run: |
+          mkdir -p hybrid/results
+          git archive --format=tar.gz -o /tmp/VTB-Monitor-hybrid-source.tar.gz HEAD
+          cp /tmp/VTB-Monitor-hybrid-source.tar.gz hybrid/results/
+          if test -f rust/target/release/vtb-monitor-rs; then cp rust/target/release/vtb-monitor-rs hybrid/results/; fi
+          git status --short > hybrid/results/worktree-status.txt
+          git rev-parse HEAD > hybrid/results/tested-source-commit.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-pi-parity-results
+          path: |
+            hybrid/results/
+            test-results/
+          retention-days: 30

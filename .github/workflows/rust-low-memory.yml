@@ -1,0 +1,82 @@
+name: Rust low-memory validation
+on:
+  push:
+    branches: [experiment/rust-low-memory-20260912]
+    paths: ['rust/**', '.github/workflows/rust-low-memory.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: rust-low-memory-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: rust-low-memory-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
+      - name: Toolchain and source checks
+        run: |
+          mkdir -p rust/results
+          { rustc --version; cargo --version; uname -a; cat /sys/fs/cgroup/cgroup.controllers; git rev-parse HEAD; } | tee rust/results/environment.txt
+          node --check rust/web/app.js
+          python3 -m py_compile rust/tests/*.py
+          (cd rust && cargo fmt --all)
+          git diff -- rust > rust/results/rustfmt.patch
+      - name: Rust unit and integration tests
+        run: |
+          set -o pipefail
+          cd rust
+          cargo test --all-targets --features bench-ablation 2>&1 | tee results/unit-tests.log
+      - name: Build production and test binaries
+        id: build
+        run: |
+          set -o pipefail
+          cd rust
+          cargo build --release --bin vtb-monitor-rs 2>&1 | tee results/build-production.log
+          cp target/release/vtb-monitor-rs results/vtb-monitor-rs-linux-amd64
+          cargo build --release --bins --features bench-ablation 2>&1 | tee results/build-benchmark.log
+          sha256sum results/vtb-monitor-rs-linux-amd64 target/release/vtb-monitor-rs target/release/vtbm-ablation > results/binary-sha256.txt
+          ldd results/vtb-monitor-rs-linux-amd64 > results/linked-libraries.txt
+      - name: Functional HTTP and worker replay under 150 MiB
+        run: sudo python3 rust/tests/acceptance.py --binary rust/target/release/vtb-monitor-rs --memory-mib 150
+      - name: Actual backend mixed-load stress under 100 MiB
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: sudo python3 rust/tests/soak.py --binary rust/target/release/vtb-monitor-rs --memory-mib 100 --seconds 90
+      - name: One-factor ablations under 150 MiB
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: sudo python3 rust/tests/ablation.py --binary rust/target/release/vtb-monitor-rs --repetitions 3 --memory-mib 150
+      - name: Package tested source, binaries and raw results
+        if: always()
+        run: |
+          tar --exclude=rust/target --exclude=rust/results --exclude=rust/tests/__pycache__ -czf /tmp/vtb-monitor-rust-source.tar.gz rust src/lib/server/migrations.ts
+          cp /tmp/vtb-monitor-rust-source.tar.gz rust/results/
+          python3 - <<'PY'
+          import json,pathlib
+          p=pathlib.Path('rust/results')
+          for name in ['acceptance.json','acceptance-failure.json','ablation.json','soak/summary.json']:
+              f=p/name
+              if f.exists():
+                  data=json.loads(f.read_text())
+                  if name=='ablation.json': data={k:data[k] for k in ['experiment','claimBoundary','optimizedPassed','summary']}
+                  if name=='acceptance.json': data={k:data[k] for k in ['passed','checkCount','checks','processes','claimBoundary']}
+                  print(name, json.dumps(data,ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-low-memory-results
+          path: |
+            rust/results/
+            rust/Cargo.lock
+          if-no-files-found: error
+          retention-days: 30

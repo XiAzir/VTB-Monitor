@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const dataDir = resolve(process.env.DATA_DIR ?? 'data');
-const mediaDir = resolve(dataDir, 'media');
+const mediaDir = resolve(process.env.MEDIA_DIR ?? resolve(dataDir, 'media'));
 const backupDir = resolve(dataDir, 'backups');
 
 for (const directory of [dataDir, mediaDir, backupDir]) {
@@ -27,7 +27,7 @@ export const config = {
   dataDir,
   mediaDir,
   backupDir,
-  databasePath: resolve(dataDir, 'vtb-monitor.sqlite'),
+  databasePath: resolve(process.env.DATABASE_PATH ?? resolve(dataDir, 'vtb-monitor.sqlite')),
   piDatabasePath: resolve(dataDir, 'pi-sessions.sqlite'),
   mediaQuotaBytes: Number(process.env.MEDIA_QUOTA_BYTES ?? 5 * 1024 * 1024 * 1024),
   maxMediaFileBytes: Number(process.env.MAX_MEDIA_FILE_BYTES ?? 25 * 1024 * 1024),
