@@ -1,1 +1,1 @@
-review-2: revision contract, original schedule rollover, reject backslashes, fail on incomplete images
+review-3: correct isolated fixture configuration, original UI screenshots, readonly test workflow
