@@ -191,21 +191,27 @@ export async function recognizeScheduleDraftWithPi(draftId: string): Promise<voi
       const batch = await loadDraftImages(scheduleBatch.urls);
       if (batch.length !== scheduleBatch.urls.length) throw new Error('图片证据不完整，识别草稿未提交');
       const batchEntries: ScheduleDraftEntry[] = [];
+      let submitted = false;
       let assistantMessage: any = null;
       let forcedToolError: string | null = null;
       const conversationId = ensureConversation(String(draft.streamerId), 'schedule', `周表 ${draftId}`);
       const tools: AgentTool[] = [{
         name: 'propose_schedule_draft', label: '提交周表识别草稿', description: '提交当前图片批次中属于目标主播的周表条目。没有匹配条目时提交空数组。',
         parameters: Type.Object({ entries: scheduleEntriesSchema() }),
-        execute: async (_id, params) => auditedTool(conversationId, 'propose_schedule_draft', params, () => {
-          const entries = (params as { entries: ScheduleDraftEntry[] }).entries;
-          batchEntries.push(...entries);
-          return { count: entries.length };
-        })
+        execute: async (_id, params) => {
+          const result = await auditedTool(conversationId, 'propose_schedule_draft', params, () => {
+            const entries = (params as { entries: ScheduleDraftEntry[] }).entries;
+            batchEntries.push(...entries);
+            return { count: entries.length };
+          });
+          submitted = true;
+          return result;
+        }
       }];
       const agent = new Agent({ initialState: { systemPrompt: buildScheduleRecognitionPrompt(), model,
         thinkingLevel: 'off', tools, messages: [] }, streamFn: models.streamSimple.bind(models),
         getApiKey: () => apiKey, sessionId: `schedule-${draftId}-batch-${batchIndex + 1}`, toolExecution: 'sequential',
+        shouldStopAfterTurn: ({ toolResults }) => submitted && toolResults.every(tool => !tool.isError),
         onPayload: profile.provider === 'anthropic' && profile.baseUrl ? undefined : (payload) => forceInitialScheduleTool(payload) });
       agent.subscribe((agentEvent) => {
         const eventAny = agentEvent as any;
@@ -219,7 +225,8 @@ export async function recognizeScheduleDraftWithPi(draftId: string): Promise<voi
         assistantMessage = null;
         const fallbackAgent = new Agent({ initialState: { systemPrompt: buildScheduleRecognitionPrompt(), model,
           thinkingLevel: 'off', tools, messages: [] }, streamFn: models.streamSimple.bind(models),
-          getApiKey: () => apiKey, sessionId: `schedule-${draftId}-batch-${batchIndex + 1}-fallback`, toolExecution: 'sequential' });
+          getApiKey: () => apiKey, sessionId: `schedule-${draftId}-batch-${batchIndex + 1}-fallback`, toolExecution: 'sequential',
+          shouldStopAfterTurn: ({ toolResults }) => submitted && toolResults.every(tool => !tool.isError) });
         fallbackAgent.subscribe((agentEvent) => {
           const eventAny = agentEvent as any;
           if (eventAny.type === 'message_end' && eventAny.message?.role === 'assistant') assistantMessage = eventAny.message;
@@ -315,7 +322,8 @@ async function analyzeDynamicRevisionWithPiLocked(revisionId: string, row: Row, 
   }];
   const agent = new Agent({ initialState: { systemPrompt: buildRevisionSystemPrompt(), model,
     thinkingLevel: profile.thinkingLevel ?? 'low', tools, messages: [] }, streamFn: models.streamSimple.bind(models),
-    getApiKey: () => apiKey, sessionId: `revision-${current.id}`, toolExecution: 'sequential' });
+    getApiKey: () => apiKey, sessionId: `revision-${current.id}`, toolExecution: 'sequential',
+    shouldStopAfterTurn: ({ toolResults }) => result !== null && toolResults.every(tool => !tool.isError) });
   agent.subscribe((agentEvent) => {
     const eventAny = agentEvent as any;
     if (eventAny.type === 'message_end' && eventAny.message?.role === 'assistant') {
