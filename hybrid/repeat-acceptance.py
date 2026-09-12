@@ -16,13 +16,13 @@ def main():
     args=p.parse_args()
     if not 1 <= args.repetitions <= 10 or args.memory_mib <= 0: p.error('enforced positive limit and 1..10 repetitions required')
     result_dir=ROOT/'hybrid/results'; matrix=result_dir/'ablation'; matrix.mkdir(parents=True,exist_ok=True)
-    cases=[(mode, rep) for mode in ['optimized','without_request_boundary_gc'] for rep in range(args.repetitions)]
+    cases=[(mode, rep) for mode in ['default','with_request_boundary_gc'] for rep in range(args.repetitions)]
     random.Random(20260912).shuffle(cases)
     runs=[]
     for mode, rep in cases:
         dest=matrix/f'{mode}-{rep+1}'; dest.mkdir(exist_ok=True)
         report_path=result_dir/'acceptance.json'; report_path.unlink(missing_ok=True)
-        env={**os.environ, 'VTBM_REQUEST_GC': '1' if mode=='optimized' else '0'}
+        env={**os.environ, 'VTBM_REQUEST_GC': '1' if mode=='with_request_boundary_gc' else '0'}
         with (dest/'driver.log').open('w') as log:
             run=subprocess.run([sys.executable,'hybrid/acceptance.py','--binary',args.binary,'--memory-mib',str(args.memory_mib)],
                 cwd=ROOT,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=180)
@@ -39,7 +39,7 @@ def main():
             'elapsedSeconds':process.get('elapsedSeconds'), 'report':str(dest.relative_to(ROOT)/'acceptance.json')}
         runs.append(record); print(json.dumps(record,ensure_ascii=False),flush=True)
     summary={}
-    for mode in ['optimized','without_request_boundary_gc']:
+    for mode in ['default','with_request_boundary_gc']:
         rows=[r for r in runs if r['mode']==mode]
         summary[mode]={'runs':len(rows),'passed':sum(r['passed'] for r in rows),
             'peakMiBMedian':statistics.median(r['cgroupPeakMiB'] for r in rows),
@@ -51,6 +51,6 @@ def main():
         'summary':summary,'runs':runs}
     (matrix/'summary.json').write_text(json.dumps(output,ensure_ascii=False,indent=2))
     print('HYBRID_REPEATED_SUMMARY='+json.dumps(summary),flush=True)
-    if summary['optimized']['passed'] != args.repetitions: raise SystemExit('optimized full-backend acceptance did not pass every repetition')
+    if summary['default']['passed'] != args.repetitions: raise SystemExit('default full-backend acceptance did not pass every repetition')
 
 if __name__=='__main__': main()
