@@ -1,1 +1,1 @@
-review-3: correct isolated fixture configuration, original UI screenshots, readonly test workflow
+review-4: HTML form Accept parity, real SDK streaming and all-process memory verification

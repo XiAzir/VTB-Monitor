@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Original Pi SDK + Svelte routes through Rust. Only the provider is mocked.
-The Rust process AND its Node child are measured in the SAME bounded cgroup.
+"""Exercise original Svelte and TypeScript Pi through Rust; only the provider is mocked.
+The Rust process AND every Node child enter one memory-limited cgroup before exec.
 """
-import argparse, base64, datetime, http.server, json, os, pathlib, sqlite3, subprocess, sys, tempfile, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+import argparse, base64, datetime, http.server, json, os, pathlib, sqlite3, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request, uuid
 sys.path.insert(0, str(pathlib.Path('rust/tests').resolve()))
 from harness import Process, free_port
 
@@ -46,6 +46,9 @@ class Model(http.server.BaseHTTPRequestHandler):
             emit('message_stop',{})
         except (BrokenPipeError,ConnectionResetError):pass
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,*a,**k):return None
+
 def main(args):
     out=pathlib.Path('hybrid/results');out.mkdir(parents=True,exist_ok=True)
     mock=http.server.ThreadingHTTPServer(('127.0.0.1',0),Model)
@@ -61,7 +64,7 @@ def main(args):
       env={**os.environ,'NODE_ENV':'development','HOST':'127.0.0.1','PORT':str(port),'MANAGEMENT_PORT':str(management),
            'ORIGIN':origin,'DATA_DIR':temp,'VTBM_APP_ROOT':str(pathlib.Path.cwd()),'VTBM_TEST_MODE':'1','DISABLE_SCHEDULER':'0',
            'VTBM_SIDECAR_IDLE_MS':'2000','ADMIN_INITIAL_PASSWORD':'hybrid-password-123',
-           'APP_ENCRYPTION_KEY':base64.b64encode(b'H'*32).decode(),'MOCK_PI_ORIGIN':f'http://127.0.0.1:{mock.server_port}', 'MALLOC_ARENA_MAX':'2'}
+           'APP_ENCRYPTION_KEY':base64.b64encode(os.urandom(32)).decode(),'MOCK_PI_ORIGIN':f'http://127.0.0.1:{mock.server_port}', 'MALLOC_ARENA_MAX':'2'}
       for key in ['DATABASE_PATH','MEDIA_DIR','VTBM_NATIVE_EXPERIMENTAL','BILI_MOCK_ORIGIN']:env.pop(key,None)
       seed=subprocess.run(['node','--import','tsx','hybrid/seed-pi.ts'],env=env,capture_output=True,text=True)
       (out/'seed.log').write_text(seed.stdout+'\n'+seed.stderr)
@@ -82,12 +85,13 @@ def main(args):
               if req('/healthz').status==200:break
           except OSError:time.sleep(.05)
       r=req('/');html=r.read().decode();check('original homepage served',r.status==200 and '主播监控' in html)
-      class NoRedirect(urllib.request.HTTPRedirectHandler):
-          def redirect_request(self,*a,**k):return None
       opener=urllib.request.build_opener(NoRedirect)
-      try:r=opener.open(urllib.request.Request(origin+'/admin?/login',data=b'username=admin&password=hybrid-password-123',headers={'Origin':origin,'Content-Type':'application/x-www-form-urlencoded'}))
+      # Browser navigation accepts HTML. Without Accept, SvelteKit intentionally
+      # negotiates a JSON action response; that is NOT a missing 303 redirect.
+      try:r=opener.open(urllib.request.Request(origin+'/admin?/login',data=b'username=admin&password=hybrid-password-123',headers={'Origin':origin,'Content-Type':'application/x-www-form-urlencoded','Accept':'text/html'}))
       except urllib.error.HTTPError as e:r=e
       cookie=(r.headers.get('Set-Cookie') or '').split(';',1)[0]
+      (out/'login-response.json').write_text(json.dumps({'status':r.status,'location':r.headers.get('Location'),'cookieIssued':bool(cookie)}))
       check('original form login preserves Set-Cookie and redirect',r.status==303 and cookie.startswith('vtbm_session='))
       r=req('/admin');check('original admin server load',r.status==200 and '审核周表识别' in r.read().decode())
       r=req('/v1/healthz',base=f'http://127.0.0.1:{management}');check('management listener preserved',r.status==200 and json.load(r)['status']=='ok')
