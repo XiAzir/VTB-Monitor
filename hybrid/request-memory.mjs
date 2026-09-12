@@ -12,6 +12,8 @@ export function wrapRequestMemory(fetchFn, collect, threshold = 1024 * 1024) {
   };
 }
 export function installRequestMemoryBoundary() {
-  if (process.env.VTBM_REQUEST_GC === '0' || typeof globalThis.gc !== 'function') return;
+  // Repeated integration did not establish a peak-memory benefit. Opt in only.
+  if (process.env.VTBM_REQUEST_GC !== '1' || typeof globalThis.gc !== 'function') return false;
   globalThis.fetch = wrapRequestMemory(globalThis.fetch.bind(globalThis), () => globalThis.gc());
+  return true;
 }
