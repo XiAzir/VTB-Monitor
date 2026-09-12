@@ -8,9 +8,13 @@ Type=simple
 User=vtb-monitor
 Group=vtb-monitor
 WorkingDirectory=/opt/vtb-monitor
-EnvironmentFile=/etc/vtb-monitor.env
+EnvironmentFile=/etc/vtb-monitor-hybrid.env
 Environment=NODE_ENV=production
 Environment=VTBM_APP_ROOT=/opt/vtb-monitor
+Environment=DATA_DIR=/var/lib/vtb-monitor-hybrid
+Environment=DATABASE_PATH=/var/lib/vtb-monitor-hybrid/vtb-monitor.sqlite
+Environment=MEDIA_DIR=/var/lib/vtb-monitor-hybrid/media
+Environment=VTBM_REQUEST_GC=0
 Environment=VTBM_NODE=/usr/bin/node
 Environment=VTBM_SIDECAR_IDLE_MS=30000
 Environment=MALLOC_ARENA_MAX=2
@@ -25,6 +29,9 @@ MemoryAccounting=true
 MemoryMax=150M
 MemorySwapMax=0
 CPUQuota=100%
+StateDirectory=vtb-monitor-hybrid
+StateDirectoryMode=0700
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
