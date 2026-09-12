@@ -1,6 +1,6 @@
 use anyhow::{bail,Context,Result};
 use std::{path::PathBuf,sync::atomic::Ordering,time::Duration,future::IntoFuture};
-use vtb_monitor_rs::{api,db,engine,forecast,limits,App};
+use vtb_monitor_rs::{api,db,engine,forecast,monitor,limits,App};
 
 fn main()->Result<()> {
     let args:Vec<String>=std::env::args().collect();
@@ -32,6 +32,7 @@ fn main()->Result<()> {
         let worker=if enabled {Some(tokio::task::spawn_local(engine::run(app.clone())))}else{None};
         let live=if enabled {Some(tokio::task::spawn_local(engine::live_loop(app.clone())))}else{None};
         let predictions=if enabled {Some(tokio::task::spawn_local(forecast::run(app.clone())))}else{None};
+        let notifications=if enabled {Some(tokio::task::spawn_local(monitor::run(app.clone())))}else{None};
         let web=tokio::spawn(axum::serve(limits::LimitedListener::new(listener,16),api::router(app.clone())).into_future());
         let management=tokio::spawn(axum::serve(limits::LimitedListener::new(admin_listener,4),api::management_router(app.clone())).into_future());
         println!("{}",serde_json::json!({"event":"ready","pid":std::process::id(),"port":port,"managementPort":management_port,"runtime":"rust","scheduler":enabled}));
@@ -39,6 +40,7 @@ fn main()->Result<()> {
         #[cfg(not(unix))]tokio::signal::ctrl_c().await?;
         app.stopping.store(true,Ordering::Relaxed);web.abort();management.abort();
         if let Some(live)=live{live.abort();}if let Some(predictions)=predictions{predictions.abort();}
+        if let Some(notifications)=notifications{notifications.abort();}
         if let Some(worker)=worker{let _=tokio::time::timeout(Duration::from_secs(130),worker).await;}
         Ok::<(),anyhow::Error>(())
     }))?;
