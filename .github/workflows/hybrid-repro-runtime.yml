@@ -1,0 +1,31 @@
+name: Hybrid isolated runtime
+on:
+  push:
+    branches: [refactor/original-ui-typescript-pi]
+    paths: [.github/workflows/hybrid-repro-runtime.yml]
+permissions:
+  contents: read
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - name: Package only development runtime, no app data or secrets
+        run: |
+          mkdir -p /tmp/hybrid-repro
+          cp "$(command -v node)" /tmp/hybrid-repro/node
+          tar --exclude='*.ttf' --exclude='*.otf' --exclude='*.woff' --exclude='*.woff2' --exclude='*.eot' -czf /tmp/hybrid-repro/runtime.tar.gz node_modules build
+          git archive --format=tar.gz -o /tmp/hybrid-repro/source.tar.gz HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hybrid-repro-runtime
+          path: /tmp/hybrid-repro/
+          retention-days: 3
