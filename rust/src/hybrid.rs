@@ -115,8 +115,9 @@ fn target(port: u16, namespace: &str, path: &str) -> Result<url::Url> {
     Ok(url)
 }
 fn clean_headers(headers: &mut HeaderMap) {
-    let named: Vec<String> = headers.get("connection").and_then(|v|v.to_str().ok()).unwrap_or("")
-        .split(',').map(|s|s.trim().to_owned()).filter(|s|!s.is_empty()).collect();
+    let named: Vec<String> = headers.get_all("connection").iter()
+        .filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(','))
+        .map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
     for name in named { headers.remove(name.as_str()); }
     for name in ["connection","keep-alive","proxy-authenticate","proxy-authorization","te","trailer","transfer-encoding","upgrade",
         "x-vtbm-sidecar-token","x-vtbm-management-listener"] { headers.remove(name); }
@@ -142,7 +143,8 @@ async fn forward_inner(app: Arc<App>, request: Request<Body>, management: bool) 
     let expensive: Option<OwnedSemaphorePermit> = if parts.method != Method::GET && parts.method != Method::HEAD {
         Some(app.expensive.clone().try_acquire_owned().map_err(|_|anyhow::anyhow!("BUSY: Pi/authentication capacity"))?)
     } else { None };
-    let lease = bridge.acquire().await?; let bytes = to_bytes(body, 512*1024).await.context("request body exceeds 512 KiB")?;
+    let lease = bridge.acquire().await?;
+    let bytes = read_request_body(body, Duration::from_secs(15)).await?;
     let mut headers = parts.headers; clean_headers(&mut headers); headers.remove("content-length");
     let upstream = bridge.client.request(parts.method,target(lease.port,namespace,path)?)
         .headers(headers).header("x-vtbm-sidecar-token",&bridge.token).body(bytes).send().await?;
@@ -154,12 +156,41 @@ async fn forward_inner(app: Arc<App>, request: Request<Body>, management: bool) 
     });
     Ok(response.body(Body::from_stream(stream))?)
 }
+async fn read_request_body(body: Body, deadline: Duration) -> Result<bytes::Bytes> {
+    tokio::time::timeout(deadline, to_bytes(body, 512 * 1024)).await
+        .context("request body read deadline")?
+        .context("request body exceeds 512 KiB or was interrupted")
+}
 #[cfg(test)] mod tests {
     use super::*;
     #[test] fn strips_hop_headers_and_private_capabilities() {
         let mut h=HeaderMap::new();h.insert("connection","x-private, keep-alive".parse().unwrap());h.insert("x-private","bad".parse().unwrap());
         h.insert("x-vtbm-sidecar-token","bad".parse().unwrap());h.insert("cookie","vtbm_session=test".parse().unwrap());
         clean_headers(&mut h);assert!(!h.contains_key("x-private"));assert!(!h.contains_key("x-vtbm-sidecar-token"));assert!(h.contains_key("cookie"));
+    }
+    #[test] fn strips_every_connection_field_but_preserves_response_cookies() {
+        let mut h = HeaderMap::new();
+        h.append("connection", "x-first".parse().unwrap());
+        h.append("connection", "x-second, keep-alive".parse().unwrap());
+        h.insert("x-first", "one".parse().unwrap());
+        h.insert("x-second", "two".parse().unwrap());
+        h.append("set-cookie", "first=1; HttpOnly".parse().unwrap());
+        h.append("set-cookie", "second=2; HttpOnly".parse().unwrap());
+        h.insert("location", "/admin".parse().unwrap());
+        clean_headers(&mut h);
+        assert!(!h.contains_key("x-first")); assert!(!h.contains_key("x-second"));
+        assert_eq!(h.get_all("set-cookie").iter().count(), 2);
+        assert_eq!(h.get("location").unwrap(), "/admin");
+    }
+    #[tokio::test] async fn request_body_is_bounded_and_not_rewritten() {
+        let input = bytes::Bytes::from_static(b"name=original%20form");
+        assert_eq!(read_request_body(Body::from(input.clone()), Duration::from_secs(1)).await.unwrap(), input);
+        assert!(read_request_body(Body::from(vec![0u8; 512 * 1024 + 1]), Duration::from_secs(1)).await.is_err());
+    }
+    #[tokio::test] async fn stalled_body_cannot_hold_admission_forever() {
+        let body = Body::from_stream(stream::pending::<Result<bytes::Bytes, io::Error>>());
+        let error = read_request_body(body, Duration::from_millis(10)).await.unwrap_err();
+        assert!(error.to_string().contains("deadline"));
     }
     #[test] fn cannot_escape_public_namespace() {
         for path in ["/../control/pi", "/%2e%2e/control/pi", "/%2E./management/v1/healthz", "/\\..\\control/pi"] { assert!(target(1234,"web",path).is_err(),"{path}"); }
