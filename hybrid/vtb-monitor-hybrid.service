@@ -1,0 +1,36 @@
+[Unit]
+Description=VTB Monitor Rust core with original UI and TypeScript Pi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vtb-monitor
+Group=vtb-monitor
+WorkingDirectory=/opt/vtb-monitor
+EnvironmentFile=/etc/vtb-monitor.env
+Environment=NODE_ENV=production
+Environment=VTBM_APP_ROOT=/opt/vtb-monitor
+Environment=VTBM_NODE=/usr/bin/node
+Environment=VTBM_SIDECAR_IDLE_MS=30000
+Environment=MALLOC_ARENA_MAX=2
+ExecStart=/opt/vtb-monitor/rust/target/release/vtb-monitor-rs
+Restart=on-failure
+RestartSec=15s
+TimeoutStopSec=145s
+KillMode=control-group
+MemoryAccounting=true
+# This is an enforced budget, not proof that every production input completes.
+# Verify your workload before enabling the limit. Child Node is included.
+MemoryMax=150M
+MemorySwapMax=0
+CPUQuota=100%
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/vtb-monitor-hybrid
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

@@ -1,1 +1,1 @@
-review-4: HTML form Accept parity, real SDK streaming and all-process memory verification
+review-5: private child lifecycle, absolute data paths, reclaim large-request temporaries, real 9 MiB fixture unchanged
