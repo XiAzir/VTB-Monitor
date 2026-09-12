@@ -31,9 +31,14 @@ pub async fn run(app:Arc<App>){
     }
 }
 async fn enqueue_due(app:&Arc<App>)->Result<()>{
-    app.db.call(|db|{
+    let original_pi=app.bridge.is_some();
+    app.db.call(move|db|{
         let due=rows(db,"SELECT s.id FROM streamers s WHERE enabled=1 AND (last_dynamic_sync_at IS NULL OR (julianday('now')-julianday(last_dynamic_sync_at))*86400>=dynamic_poll_seconds) AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.entity_id=s.id AND j.type='sync_streamer' AND j.status IN ('pending','retry','running')) ORDER BY COALESCE(last_dynamic_sync_at,'') LIMIT 20",&[],20)?;
         for s in due{let sid=strv(&s,"id");enqueue(db,"sync_streamer",sid,json!({}),20,0,&format!("periodic:{sid}:{}",Utc::now().timestamp()/60))?;}
+        if original_pi {
+            let expired=rows(db,"SELECT f.id,f.streamer_id FROM forecasts f JOIN streamers s ON s.id=f.streamer_id WHERE f.active=1 AND s.enabled=1 AND f.predicted_start_at<=? AND f.source IN ('weekly_schedule','schedule_confirmed') AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.dedupe_key='hybrid-roll:'||f.id) LIMIT 20",&[&now()],20)?;
+            for f in expired { enqueue(db,"hybrid_roll_schedule",strv(&f,"streamer_id"),json!({}),30,0,&format!("hybrid-roll:{}",strv(&f,"id")))?; }
+        }
         db.execute("UPDATE forecasts SET stale=1 WHERE active=1 AND stale=0 AND predicted_start_at<=?",[now()])?;
         let day=Utc::now().timestamp()/86400;enqueue(db,"cleanup_storage","",json!({}),95,0,&format!("cleanup:{day}"))?;
         Ok(())
@@ -69,7 +74,7 @@ async fn poll_live(app:&Arc<App>)->Result<()>{
 }
 async fn execute(app:&Arc<App>,job:&Value)->Result<()>{
     if let Some(bridge) = &app.bridge {
-        if ["rs_analyze_dynamic", "pi_analyze", "pi_revision", "recognize_schedule"].contains(&strv(job, "type")) {
+        if ["rs_analyze_dynamic", "pi_analyze", "pi_revision", "recognize_schedule", "hybrid_roll_schedule"].contains(&strv(job, "type")) {
             return bridge.run_job(app, job).await;
         }
     }
@@ -113,7 +118,8 @@ async fn sync_streamer(app:&Arc<App>,sid:&str,mut payload:Value)->Result<()>{
             if detail["mediaUrls"].as_array().is_some_and(|a|!a.is_empty()){dynamic["mediaUrls"]=detail["mediaUrls"].clone();}
             dynamic["raw"]["emojiMap"]=detail["emojiMap"].clone();
         }
-        let sid=sid.to_owned();let scan=scan.clone();app.db.call(move|db|{business::upsert_dynamic(db,&sid,&dynamic)?;db.execute("INSERT OR IGNORE INTO rs_scan_items VALUES(?,?)",params![scan,strv(&dynamic,"id")])?;Ok(())}).await?;
+        let sid=sid.to_owned();let scan=scan.clone();let original_pi=app.bridge.is_some();app.db.call(move|db|{
+            if original_pi { business::upsert_dynamic_with_pi(db,&sid,&dynamic)?; } else { business::upsert_dynamic(db,&sid,&dynamic)?; }db.execute("INSERT OR IGNORE INTO rs_scan_items VALUES(?,?)",params![scan,strv(&dynamic,"id")])?;Ok(())}).await?;
     }
     let offset=strv(&feed,"offset").to_owned();let more=feed["has_more"].as_bool().unwrap_or(false);
     if full && more && !all_old && !offset.is_empty(){
@@ -134,7 +140,8 @@ async fn refresh_dynamic(app:&Arc<App>,did:&str)->Result<()>{
     let did_owned=did.to_owned();let old=app.db.call(move|db|one(db,"SELECT * FROM dynamics WHERE id=?",&[&did_owned])).await?;
     if old.is_null(){return Ok(());}
     let mut detail=app.bili.detail(did).await?;detail["id"]=json!(did);detail["publishedAt"]=old["published_at"].clone();detail["type"]=old["type"].clone();detail["raw"]=serde_json::from_str(strv(&old,"raw_excerpt")).unwrap_or(json!({}));
-    let sid=strv(&old,"streamer_id").to_owned();app.db.call(move|db|{business::upsert_dynamic(db,&sid,&detail)?;db.execute("UPDATE dynamics SET content_quality='detail',detail_fetched_at=? WHERE id=?",params![now(),strv(&detail,"id")])?;Ok(())}).await
+    let sid=strv(&old,"streamer_id").to_owned();let original_pi=app.bridge.is_some();app.db.call(move|db|{
+        if original_pi { business::upsert_dynamic_with_pi(db,&sid,&detail)?; } else { business::upsert_dynamic(db,&sid,&detail)?; }db.execute("UPDATE dynamics SET content_quality='detail',detail_fetched_at=? WHERE id=?",params![now(),strv(&detail,"id")])?;Ok(())}).await
 }
 async fn sync_comments(app:&Arc<App>,did:&str,mut payload:Value)->Result<()>{
     let key=did.to_owned();let dynamic=app.db.call(move|db|one(db,"SELECT d.*,s.bili_uid,s.enabled FROM dynamics d JOIN streamers s ON s.id=d.streamer_id WHERE d.id=?",&[&key])).await?;

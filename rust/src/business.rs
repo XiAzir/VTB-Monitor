@@ -101,6 +101,12 @@ fn semantic_metadata(mut value: Value) -> Value {
     value
 }
 pub fn upsert_dynamic(db: &mut Connection, sid: &str, input: &Value) -> Result<(bool,bool)> {
+    upsert_dynamic_impl(db, sid, input, false)
+}
+pub fn upsert_dynamic_with_pi(db: &mut Connection, sid: &str, input: &Value) -> Result<(bool,bool)> {
+    upsert_dynamic_impl(db, sid, input, true)
+}
+fn upsert_dynamic_impl(db: &mut Connection, sid: &str, input: &Value, original_pi: bool) -> Result<(bool,bool)> {
     let did = required(input,"id",40)?; let text = input["text"].as_str().unwrap_or("");
     if text.len() > 128*1024 { bail!("dynamic needs chunking; not marking it analyzed"); }
     let published = required(input,"publishedAt",50)?; chrono::DateTime::parse_from_rfc3339(published)?;
@@ -121,8 +127,15 @@ pub fn upsert_dynamic(db: &mut Connection, sid: &str, input: &Value) -> Result<(
         let rid = id(); let mut snapshot = existing.clone(); snapshot["mediaUrls"] = json!(old_urls);
         tx.execute("INSERT INTO dynamic_revisions(id,dynamic_id,text,content_hash,snapshot_json,created_at) VALUES(?,?,?,?,?,?)",params![rid,did,strv(&existing,"text"),strv(&existing,"content_hash"),snapshot.to_string(),now()])?;
         for item in &old_media { tx.execute("INSERT OR IGNORE INTO rs_media_refs VALUES('dynamic_revision',?,?)",params![rid,strv(item,"id")])?; }
+        if original_pi {
+            // Preserve derived state for the original revision analyzer to decide
+            // whether the edit cancels, moves or does not affect the announcement.
+            tx.execute("INSERT INTO pi_revision_analyses(revision_id,dynamic_id,created_at,updated_at) VALUES(?,?,?,?)",params![rid,did,now(),now()])?;
+            enqueue(&tx,"pi_revision",&rid,json!({"dynamicId":did}),24,30,&format!("pi-revision:{rid}"))?;
+        } else {
         tx.execute("UPDATE forecasts SET stale=1 WHERE streamer_id=? AND active=1 AND source!='manual' AND (evidence_json LIKE ? OR EXISTS(SELECT 1 FROM json_each(forecasts.evidence_json) e JOIN timeline_events t ON t.id=json_extract(e.value,'$.id') WHERE t.source_type='dynamic' AND t.source_id=?))",params![sid,format!("%{did}%"),did])?;
         tx.execute("UPDATE timeline_events SET active=0,updated_at=? WHERE source_type='dynamic' AND source_id=?",params![now(),did])?;
+        }
     }
     tx.execute("INSERT INTO dynamics(id,streamer_id,type,text,source_url,published_at,updated_at,last_seen_at,content_hash,comment_oid,comment_type,comment_count,like_count,raw_excerpt,is_pinned,last_content_change_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET type=excluded.type,text=excluded.text,state='visible',updated_at=excluded.updated_at,last_seen_at=excluded.last_seen_at,content_hash=excluded.content_hash,comment_oid=COALESCE(NULLIF(excluded.comment_oid,''),dynamics.comment_oid),comment_type=COALESCE(NULLIF(excluded.comment_type,''),dynamics.comment_type),comment_count=excluded.comment_count,like_count=excluded.like_count,raw_excerpt=excluded.raw_excerpt,is_pinned=excluded.is_pinned,missing_complete_scans=0,last_missing_scan_id=NULL,last_content_change_at=CASE WHEN dynamics.content_hash!=excluded.content_hash THEN excluded.updated_at ELSE dynamics.last_content_change_at END",
         params![did,sid,kind,text,format!("https://t.bilibili.com/{did}"),published,now(),now(),hash,input["commentOid"].as_str(),input["commentType"].as_str(),number(input,"commentCount",number(&existing,"comment_count",0)),number(input,"likeCount",number(&existing,"like_count",0)),raw.to_string(),input["isPinned"].as_bool().map(|b|b as i64).unwrap_or(number(&existing,"is_pinned",0)),published])?;
@@ -131,7 +144,7 @@ pub fn upsert_dynamic(db: &mut Connection, sid: &str, input: &Value) -> Result<(
         tx.execute("INSERT OR IGNORE INTO comment_sync_state(dynamic_id,next_sync_at,updated_at) VALUES(?,?,?)",params![did,now(),now()])?;
         enqueue(&tx,"sync_comments",did,json!({}),50,0,&format!("comments-initial:{did}"))?;
     }
-    if changed {
+    if changed && (!original_pi || existing.is_null()) {
         tx.execute("INSERT INTO pi_pending_dynamics(streamer_id,dynamic_id,detected_at) VALUES(?,?,?) ON CONFLICT(streamer_id,dynamic_id) DO UPDATE SET detected_at=excluded.detected_at",params![sid,did,now()])?;
         enqueue(&tx,"rs_analyze_dynamic",did,json!({"contentHash":hash}),35,30,&format!("analysis:{did}:{hash}"))?;
     }

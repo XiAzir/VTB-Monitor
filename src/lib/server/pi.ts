@@ -167,6 +167,15 @@ export async function recognizeScheduleDraftWithPi(draftId: string): Promise<voi
     const mediaUrls = currentScheduleDraftMediaUrls(String(draft.dynamicId), draft.mediaUrls);
     const imageBatches = await loadScheduleImageBatches(mediaUrls);
     const loadedImageCount = imageBatches.reduce((count, batch) => count + batch.positions.length, 0);
+    if (loadedImageCount < mediaUrls.length) {
+      const incomplete = draftMediaState(mediaUrls);
+      if (Number(incomplete.pending ?? 0) > 0) {
+        getDb().prepare("UPDATE schedule_drafts SET status='pending',error=?,updated_at=? WHERE id=? AND status='processing'")
+          .run('等待全部周表图片完成本地归档', new Date().toISOString(), draftId);
+        throw new ScheduleImagesPendingError();
+      }
+      throw new Error('周表图片未完整归档，未提交部分识别结果');
+    }
     if (loadedImageCount === 0) {
       const state = draftMediaState(mediaUrls);
       if (Number(state.pending ?? 0) > 0) {

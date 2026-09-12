@@ -104,6 +104,7 @@ impl Bridge {
     }
 }
 fn target(port: u16, namespace: &str, path: &str) -> Result<url::Url> {
+    if path.split('?').next().unwrap_or("").contains('\\') { bail!("backslash in request path"); }
     let url = url::Url::parse(&format!("http://127.0.0.1:{port}/{namespace}{path}"))?;
     // URL parsers normalize literal/encoded dot segments and backslashes. Check
     // AFTER parsing, otherwise /../control/pi could escape the public namespace.

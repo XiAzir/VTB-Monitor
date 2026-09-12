@@ -1,13 +1,13 @@
 /** Rust is the sole queue owner. Pi continues using its original TS implementation. */
 import { closeDb, getDb } from './db';
-import { getDynamic, getSetting, getSecret, stagePiDynamicIds } from './store';
-import type { PiProfile } from './pi-profile';
+import { getDynamic, getSetting, getSecret, stagePiDynamicIds, createManualScheduleDraft, refreshForecastFromSchedules } from './store';
+import { piRuntime, type PiProfile } from './pi-profile';
 
 type Job = { type: string; entityId: string; payload?: Record<string, unknown>; attemptNumber?: number };
 type Bridge = { run(input: unknown): Promise<void>; readonly busy: boolean; close(): void };
 const bridgeKey = Symbol.for('vtbm.hybrid.pi.v1');
 const globalRegistry = globalThis as unknown as Record<symbol, Bridge | undefined>;
-const allowed = new Set(['pi_analyze', 'pi_revision', 'recognize_schedule', 'rs_analyze_dynamic']);
+const allowed = new Set(['pi_analyze', 'pi_revision', 'recognize_schedule', 'rs_analyze_dynamic', 'hybrid_roll_schedule']);
 
 export function registerHybridPi(): void {
   if (process.env.VTBM_HYBRID_CHILD !== '1' || globalRegistry[bridgeKey]) return;
@@ -22,9 +22,10 @@ export function registerHybridPi(): void {
         throw new Error('Unsupported Pi job');
       }
       if (job.payload != null && (typeof job.payload !== 'object' || Array.isArray(job.payload))) throw new Error('Invalid Pi payload');
-      if (busy) throw new Error('BUSY: Pi is already running');
+      if (busy || piRuntime.activeRuns > 0) throw new Error('BUSY: Pi is already running');
       busy = true;
       try {
+        if (job.type === 'hybrid_roll_schedule') { refreshForecastFromSchedules(job.entityId); return; }
         const profile = getSetting<Partial<PiProfile>>('pi_profile', {});
         if (!getSecret(profile.apiKeySecret ?? 'pi_api_key')) throw new Error('DEPENDENCY: Pi API Key is not configured');
         const pi = await import('./pi');
@@ -37,6 +38,8 @@ export function registerHybridPi(): void {
           // Compatibility with jobs emitted by the Rust archive writer. Baseline may
           // have consumed multiple posts; later per-post jobs must not repeat it.
           if (!row?.enabled || row.analyzed_hash === row.content_hash) return;
+          if (dynamic.type !== 'DYNAMIC_TYPE_FORWARD' && dynamic.type !== 'forward' && dynamic.media.length > 0
+            && /(周表|日程|本周|这周|突击|直播安排|直播日历|直播计划)/i.test(dynamic.text)) createManualScheduleDraft(dynamic.id);
           stagePiDynamicIds(dynamic.streamerId, [dynamic.id]);
           await pi.analyzeStreamerWithPi(dynamic.streamerId, { mode: 'incremental', triggerReason: 'rust_content_changed', attemptNumber: job.attemptNumber ?? 1 });
         } else if (job.type === 'pi_analyze') {
